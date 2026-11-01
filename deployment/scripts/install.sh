@@ -20,10 +20,18 @@ if [[ "${EUID}" -ne 0 ]]; then
   fail "run as root: sudo bash deployment/scripts/install.sh"
 fi
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
+script_source="${BASH_SOURCE[0]:-}"
+case "${script_source}" in
+  /dev/fd/*|/dev/stdin|/proc/*/fd/*|"")
+    repo_root="$(pwd -P)"
+    ;;
+  *)
+    script_dir="$(cd -- "$(dirname -- "${script_source}")" && pwd -P)"
+    repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
+    ;;
+esac
 [[ -f "${repo_root}/backend/go.mod" && -f "${repo_root}/frontend/package-lock.json" ]] ||
-  fail "run this script from an ASNS source checkout containing backend/go.mod and frontend/package-lock.json"
+  fail "cannot locate the ASNS source checkout; when piping or using process substitution, run from the checkout root"
 
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091

@@ -10,6 +10,8 @@ From the root of an ASNS source checkout on Debian 13, run:
 sudo bash deployment/scripts/install.sh
 ```
 
+The installer builds from the local checkout; it does not download the application source. If you invoke the installer through a pipe or process substitution, keep the current directory at the checkout root.
+
 The installer installs the required Debian build packages, builds the frontend and Go API/CLI, installs the frontend and API under `/opt/asns`, installs the `asns` CLI in `/usr/local/bin`, creates a dedicated unprivileged service account, and enables the systemd service. On a new install it generates a random initial administrator password and prints it before building; save it. After the first successful startup, the bootstrap password is removed from the service environment. Reinstalling preserves the existing configuration and database.
 
 The service listens on `127.0.0.1:8080`. Use a TLS-terminating reverse proxy for remote access; do not expose the HTTP service directly to an untrusted network.
