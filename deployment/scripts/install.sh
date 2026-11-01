@@ -194,25 +194,39 @@ install -o root -g root -m 0644 "${repo_root}/deployment/systemd/asns.service" "
 chown root:"${SERVICE_GROUP}" "${CONFIG_FILE}"
 chmod 0640 "${CONFIG_FILE}"
 
+wait_for_health() {
+  local attempt
+  for attempt in $(seq 1 40); do
+    if "${CLI_FILE}" health >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+show_service_logs() {
+  systemctl status --no-pager --full "${SERVICE_NAME}" || true
+  journalctl --no-pager -u "${SERVICE_NAME}" -n 40 || true
+}
+
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
 
-healthy=0
-for attempt in $(seq 1 40); do
-  if "${CLI_FILE}" health >/dev/null 2>&1; then
-    healthy=1
-    break
-  fi
-  sleep 0.5
-done
-if [[ "${healthy}" -ne 1 ]]; then
-  systemctl status --no-pager --full "${SERVICE_NAME}" || true
-  journalctl --no-pager -u "${SERVICE_NAME}" -n 40 || true
-  fail "ASNS did not become healthy; inspect the service logs above. Existing application data was preserved."
+if ! wait_for_health; then
+  show_service_logs
+  fail "ASNS did not become healthy after initial startup; inspect the service logs above. Existing application data was preserved."
 fi
 
 sed -i '/^ASNS_ADMIN_USERNAME=/d; /^ASNS_ADMIN_PASSWORD=/d' "${CONFIG_FILE}"
-systemctl restart "${SERVICE_NAME}"
+if ! systemctl restart "${SERVICE_NAME}"; then
+  show_service_logs
+  fail "systemd could not restart ASNS after removing bootstrap credentials. Existing application data was preserved."
+fi
+if ! wait_for_health; then
+  show_service_logs
+  fail "ASNS did not become healthy after removing bootstrap credentials; inspect the service logs above. Existing application data was preserved."
+fi
 "${CLI_FILE}" health
 
 printf '\nASNS 0.1.0 is installed and enabled.\n'
