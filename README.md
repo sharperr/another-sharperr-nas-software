@@ -4,15 +4,13 @@ ASNS is a self-hosted NAS management platform for existing Linux systems—not a
 
 ## One-line install
 
-From the root of an ASNS source checkout on Debian 13, run:
+On a Debian 13 system with network access, run:
 
 ```sh
-sudo bash deployment/scripts/install.sh
+set -o pipefail && curl -fsSL https://raw.githubusercontent.com/sharperr/another-sharperr-nas-software/main/deployment/scripts/install.sh | sudo bash
 ```
 
-The installer builds from the local checkout; it does not download the application source. If you invoke the installer through a pipe or process substitution, keep the current directory at the checkout root.
-
-The installer installs the required Debian build packages, builds the frontend and Go API/CLI, installs the frontend and API under `/opt/asns`, installs the `asns` CLI in `/usr/local/bin`, creates a dedicated unprivileged service account, and enables the systemd service. On a new install it generates a random initial administrator password and prints it before building; save it. After the first successful startup, the bootstrap password is removed from the service environment. Reinstalling preserves the existing configuration and database.
+The installer installs Git and the build dependencies (Go, Node.js/npm, and OpenSSL), clones the repository's `main` branch into `/opt/asns/source` on first install, and runs `git pull --ff-only origin main` on subsequent installs. It then downloads Go modules, installs npm dependencies, builds the frontend and Go API/CLI, installs the frontend and API under `/opt/asns`, installs the `asns` CLI in `/usr/local/bin`, creates a dedicated unprivileged service account, and enables the systemd service. Updates stop rather than overwrite a source checkout with local modifications. Review the [installer script](https://github.com/sharperr/another-sharperr-nas-software/blob/main/deployment/scripts/install.sh) before running it as root. On a new install it generates a random initial administrator password and prints it before building; save it. After the first successful startup, the bootstrap password is removed from its configuration. Reinstalling preserves the existing configuration and database.
 
 The service listens on `127.0.0.1:8080`. Use a TLS-terminating reverse proxy for remote access; do not expose the HTTP service directly to an untrusted network.
 

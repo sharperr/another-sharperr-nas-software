@@ -5,6 +5,8 @@ readonly SERVICE_NAME="asns.service"
 readonly SERVICE_USER="asns"
 readonly SERVICE_GROUP="asns"
 readonly APP_DIR="/opt/asns"
+readonly SOURCE_DIR="/opt/asns/source"
+readonly SOURCE_URL="https://github.com/sharperr/another-sharperr-nas-software.git"
 readonly DATA_DIR="/var/lib/asns"
 readonly CONFIG_DIR="/etc/asns"
 readonly CONFIG_FILE="/etc/asns/asns.env"
@@ -17,21 +19,8 @@ fail() {
 }
 
 if [[ "${EUID}" -ne 0 ]]; then
-  fail "run as root: sudo bash deployment/scripts/install.sh"
+  fail "run the online installer with: set -o pipefail && curl -fsSL https://raw.githubusercontent.com/sharperr/another-sharperr-nas-software/main/deployment/scripts/install.sh | sudo bash"
 fi
-
-script_source="${BASH_SOURCE[0]:-}"
-case "${script_source}" in
-  /dev/fd/*|/dev/stdin|/proc/*/fd/*|"")
-    repo_root="$(pwd -P)"
-    ;;
-  *)
-    script_dir="$(cd -- "$(dirname -- "${script_source}")" && pwd -P)"
-    repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
-    ;;
-esac
-[[ -f "${repo_root}/backend/go.mod" && -f "${repo_root}/frontend/package-lock.json" ]] ||
-  fail "cannot locate the ASNS source checkout; when piping or using process substitution, run from the checkout root"
 
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
@@ -43,7 +32,42 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates golang-go nodejs npm openssl
+apt-get install -y --no-install-recommends ca-certificates git golang-go nodejs npm openssl
+
+command -v git >/dev/null 2>&1 || fail "Git installation failed"
+command -v go >/dev/null 2>&1 || fail "Go installation failed"
+command -v npm >/dev/null 2>&1 || fail "npm installation failed"
+
+build_dir=""
+cleanup() {
+  if [[ -n "${build_dir}" ]]; then
+    rm -rf -- "${build_dir}"
+  fi
+}
+trap cleanup EXIT
+
+install -d -o root -g root -m 0755 "${APP_DIR}"
+if [[ -d "${SOURCE_DIR}/.git" ]]; then
+  source_remote="$(git -C "${SOURCE_DIR}" remote get-url origin)" ||
+    fail "cannot read the ASNS source checkout's origin remote"
+  [[ "${source_remote}" == "${SOURCE_URL}" ]] ||
+    fail "the checkout at ${SOURCE_DIR} does not use the expected ASNS GitHub repository"
+  source_branch="$(git -C "${SOURCE_DIR}" branch --show-current)"
+  [[ "${source_branch}" == "main" ]] ||
+    fail "the ASNS source checkout at ${SOURCE_DIR} must be on the main branch"
+  [[ -z "$(git -C "${SOURCE_DIR}" status --porcelain)" ]] ||
+    fail "the ASNS source checkout at ${SOURCE_DIR} has local changes; preserve or remove them before updating"
+  printf 'Updating ASNS source with git pull...\n'
+  git -C "${SOURCE_DIR}" pull --ff-only origin main
+elif [[ -e "${SOURCE_DIR}" ]]; then
+  fail "${SOURCE_DIR} exists but is not a Git checkout; move it aside before installing"
+else
+  printf 'Cloning ASNS source from GitHub...\n'
+  git clone --single-branch --branch main "${SOURCE_URL}" "${SOURCE_DIR}"
+fi
+repo_root="${SOURCE_DIR}"
+[[ -f "${repo_root}/backend/go.mod" && -f "${repo_root}/frontend/package-lock.json" ]] ||
+  fail "the ASNS source checkout is missing required project files"
 
 go_version="$(go env GOVERSION | sed 's/^go//')"
 dpkg --compare-versions "${go_version}" ge 1.23 ||
@@ -134,10 +158,6 @@ if [[ -n "${generated_password}" ]]; then
 fi
 
 build_dir="$(mktemp -d)"
-cleanup() {
-  rm -rf -- "${build_dir}"
-}
-trap cleanup EXIT
 
 printf '\nBuilding the ASNS frontend...\n'
 (
@@ -149,6 +169,7 @@ printf '\nBuilding the ASNS frontend...\n'
 printf '\nBuilding the ASNS API and CLI...\n'
 (
   cd -- "${repo_root}/backend"
+  GOWORK=off go mod download
   GOWORK=off go test ./...
   GOWORK=off go build -trimpath -ldflags="-s -w" -o "${build_dir}/asns-server" ./cmd/asns
   GOWORK=off go build -trimpath -ldflags="-s -w" -o "${build_dir}/asns" ./cmd/asnsctl
