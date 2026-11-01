@@ -57,6 +57,43 @@ func TestAuthenticationAndCSRF(t *testing.T) {
 	}
 }
 
+func TestSystemSettingsRequireAdministratorAndAgent(t *testing.T) {
+	store, err := database.Open(filepath.Join(t.TempDir(), "asns.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureAdmin(context.Background(), "admin", "a-unique-password-longer-than-12"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateUser(context.Background(), "media", "another-unique-password-longer-than-12", 0); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(store, auth.NewService(store), monitoring.New(t.TempDir(), t.TempDir()), false, "")
+	unauthenticated := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/api/v1/system/settings", nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("system settings should require authentication; got %d", unauthenticated.Code)
+	}
+	_, userCookie := testLogin(t, handler, "media", "another-unique-password-longer-than-12")
+	userRequest := httptest.NewRequest(http.MethodGet, "/api/v1/system/settings", nil)
+	userRequest.AddCookie(userCookie)
+	userForbidden := httptest.NewRecorder()
+	handler.ServeHTTP(userForbidden, userRequest)
+	if userForbidden.Code != http.StatusForbidden {
+		t.Fatalf("system settings should be administrator-only; got %d", userForbidden.Code)
+	}
+	identity, cookie := testLogin(t, handler, "admin", "a-unique-password-longer-than-12")
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/system/settings", strings.NewReader(`{"hostname":"nas"}`))
+	request.AddCookie(cookie)
+	request.Header.Set("X-CSRF-Token", identity.CSRF)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("system settings should report missing Agent, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
 func TestFrontendFallbackAndAPI404(t *testing.T) {
 	store, err := database.Open(filepath.Join(t.TempDir(), "asns.db"))
 	if err != nil {

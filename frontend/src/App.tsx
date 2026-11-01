@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { api } from "./services/api";
-import type { BackupArchive, BackupSettings, Disk, DiskHealth, Identity, ManagedUser, MetricSample, RAIDArray, RestoreJob, RestoreStage, SMBPermission, SMBShare, SMBUser, StorageEntry, StorageListing, SystemSnapshot } from "./types/system";
+import type { BackupArchive, BackupSettings, Disk, DiskHealth, Identity, ManagedUser, MetricSample, RAIDArray, RestoreJob, RestoreStage, ServiceStatus, SMBPermission, SMBShare, SMBUser, StorageEntry, StorageListing, SystemSettings, SystemSnapshot } from "./types/system";
 
 type Page =
   | "Overview"
@@ -17,7 +17,8 @@ type Page =
   | "Applications"
   | "Monitoring"
   | "Users"
-  | "Backups";
+  | "Backups"
+  | "System settings";
 type Popover = "search" | "notifications" | "profile" | null;
 type Tone = "blue" | "purple" | "green" | "amber";
 
@@ -32,6 +33,7 @@ const managementPages: { label: Page; icon: typeof LayoutDashboard }[] = [
   { label: "Monitoring", icon: SlidersHorizontal },
   { label: "Users", icon: UserRound },
   { label: "Backups", icon: RefreshCw },
+  { label: "System settings", icon: Settings },
 ];
 
 function storedBoolean(key: string, fallback: boolean): boolean {
@@ -349,24 +351,31 @@ function SharingPage({ identity }: { identity: Identity }) {
   const [passwordEdits, setPasswordEdits] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [smbStatus, setSmbStatus] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setError("");
-    try {
-      const result = await api.shares();
+    const [sharesResult, servicesResult] = await Promise.allSettled([api.shares(), api.services()]);
+    if (sharesResult.status === "fulfilled") {
+      const result = sharesResult.value;
       setShares(result.shares);
       setUsers(result.users);
       setPermissions((current) => Object.fromEntries(result.shares.map((share) => [
         share.id, current[share.id] ?? share.permissions,
       ])));
       if (!shareUsername && result.users.length > 0) setShareUsername(result.users[0].username);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Unable to load SMB configuration");
-    } finally {
-      setLoading(false);
+    } else {
+      setError(sharesResult.reason instanceof Error ? sharesResult.reason.message : "Unable to load SMB configuration");
     }
+    if (servicesResult.status === "fulfilled") {
+      const samba = servicesResult.value.services.find((service) => service.name === "smbd.service");
+      setSmbStatus(samba ? `${samba.activeState} · ${samba.subState}` : "Service status unavailable");
+    } else {
+      setSmbStatus(servicesResult.reason instanceof Error ? servicesResult.reason.message : "Service status unavailable");
+    }
+    setLoading(false);
   }, [shareUsername]);
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -485,6 +494,11 @@ function SharingPage({ identity }: { identity: Identity }) {
       {error && <div className="error-banner" role="alert">{error}</div>}
       {notice && <div className="status-banner"><div className="status-symbol"><Check size={17} /></div>
         <div className="status-message"><strong>{notice}</strong></div></div>}
+      {!loading && <div className="status-banner">
+        <div className="status-symbol"><Network size={17} /></div>
+        <div className="status-message"><strong>Samba service: {smbStatus || "Checking…"}</strong>
+          <p>Clients connect directly to <code>\\NAS-IP\share-name</code> or <code>smb://NAS-IP/share-name</code> on your trusted LAN.</p></div>
+      </div>}
       {loading ? <div className="management-empty">Connecting to the restricted ASNS Agent…</div> : <>
         <section className="panel smb-accounts-panel">
           <div className="panel-heading"><div><h2><UserPlus size={16} /> SMB accounts</h2>
@@ -511,7 +525,7 @@ function SharingPage({ identity }: { identity: Identity }) {
         </section>
         <section className="panel smb-shares-panel">
           <div className="panel-heading"><div><h2><Network size={16} /> Network shares</h2>
-            <p>Shares expose only ASNS-created folders under <code>/srv/asns/shares</code>.</p></div></div>
+            <p>Shares expose only ASNS-created folders under <code>/srv/asns/shares</code>. Connect on your LAN using <code>\\NAS-IP\share-name</code> (Windows) or <code>smb://NAS-IP/share-name</code> (macOS/Linux), with the SMB account credentials below.</p></div></div>
           <form className="smb-share-create-form" onSubmit={(event) => void createShare(event)}>
             <label>Share name<input value={shareName} onChange={(event) => setShareName(event.target.value)}
               pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" maxLength={64} required /></label>
@@ -527,7 +541,7 @@ function SharingPage({ identity }: { identity: Identity }) {
             <div className="smb-share-list">{shares.map((share) => (
               <article className="smb-share-card" key={share.id}>
                 <div className="smb-share-heading"><div><strong>{share.name}</strong>
-                  <small>Network path: \\&lt;NAS-address&gt;\{share.name} · Data path: {share.path}</small></div>
+                  <small>Network path: {"\\\\NAS-IP\\"}{share.name} · SMB URL: smb://NAS-IP/{share.name} · Data path: {share.path}</small></div>
                   <Button variant="outline" className="outline-button danger-outline" disabled={busy} onClick={() => void removeShare(share)}>Remove share</Button>
                 </div>
                 <div className="smb-permissions">
@@ -1065,7 +1079,7 @@ function App() {
     const term = search.trim().toLowerCase();
     const availableWorkspacePages = workspacePages.filter((item) => item.label !== "Sharing" || identity?.role === "admin");
     const availableManagementPages = managementPages.filter((item) =>
-      !["Users", "Backups"].includes(item.label) || identity?.role === "admin");
+      !["Users", "Backups", "System settings"].includes(item.label) || identity?.role === "admin");
     return [...availableWorkspacePages, ...availableManagementPages].filter((item) =>
       item.label.toLowerCase().includes(term),
     );
@@ -1160,9 +1174,6 @@ function App() {
               Getting started <ChevronRight size={14} />
             </button>
           </div>
-          <button className="nav-item settings-button" onClick={() => setNotice("System settings are not implemented in ASNS 0.1.0.")}>
-            <Settings size={17} /><span>System settings</span>
-          </button>
           <div className="sidebar-version">Another Sharperr NAS Software<span className="version-badge">BETA</span></div>
         </div>
       </aside>
@@ -1265,7 +1276,9 @@ function App() {
                     ? "Create accounts and manage storage limits."
                     : page === "File manager"
                       ? "Manage files in your private, quota-limited ASNS storage."
-                  : `${page} is part of the ASNS roadmap.`}</p>
+                    : page === "System settings"
+                      ? "Manage the NAS hostname, timezone, and core service status."
+                    : `${page} is part of the ASNS roadmap.`}</p>
             </div>
             {page === "Overview" && (
               <Button variant="outline" className="outline-button refresh-button" onClick={() => void refresh()}
@@ -1292,8 +1305,9 @@ function App() {
           {page === "Monitoring" && <MonitoringPage />}
           {page === "Sharing" && identity.role === "admin" && <SharingPage identity={identity} />}
           {page === "Backups" && identity.role === "admin" && <BackupsPage identity={identity} />}
+          {page === "System settings" && identity.role === "admin" && <SystemSettingsPage identity={identity} />}
           {page !== "Overview" && page !== "Storage" && page !== "Users" && page !== "File manager" && page !== "Monitoring" &&
-            <ComingSoonPage page={page} />}
+            page !== "System settings" && <ComingSoonPage page={page} />}
 
           {page === "Overview" && (
             <>
@@ -1520,6 +1534,112 @@ function PerformanceChart({ cpu, memory }: { cpu: number[]; memory: number[] }) 
   );
 }
 
+function SystemSettingsPage({ identity }: { identity: Identity }) {
+  const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [services, setServices] = useState<ServiceStatus[]>([]);
+  const [hostname, setHostname] = useState("");
+  const [timezone, setTimezone] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const [settingsResult, servicesResult] = await Promise.allSettled([
+      api.systemSettings(),
+      api.services(),
+    ]);
+    const errors: string[] = [];
+    if (settingsResult.status === "fulfilled") {
+      setSettings(settingsResult.value);
+      setHostname(settingsResult.value.hostname);
+      setTimezone(settingsResult.value.timezone);
+    } else {
+      errors.push(settingsResult.reason instanceof Error ? settingsResult.reason.message : "System settings unavailable");
+    }
+    if (servicesResult.status === "fulfilled") {
+      setServices(servicesResult.value.services);
+    } else {
+      errors.push(servicesResult.reason instanceof Error ? servicesResult.reason.message : "Service status unavailable");
+    }
+    setError(errors.join("; "));
+  }, []);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  async function save(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const updated = await api.updateSystemSettings({ hostname: hostname.trim(), timezone: timezone.trim() }, identity.csrfToken);
+      setSettings(updated);
+      setHostname(updated.hostname);
+      setTimezone(updated.timezone);
+      setNotice("Hostname and timezone updated.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to update system settings");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restart(name: string) {
+    if (!window.confirm(`Restart ${name}? Active connections may be briefly interrupted.`)) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api.restartService(name, identity.csrfToken);
+      setNotice(`${name} restart requested.`);
+      window.setTimeout(() => { void refresh(); }, 1500);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : `Unable to restart ${name}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="management-stack">
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      {notice && <div className="status-banner"><div className="status-symbol"><Check size={17} /></div>
+        <div className="status-message"><strong>{notice}</strong></div></div>}
+      <section className="panel">
+        <div className="panel-heading"><div><h2><Settings size={16} /> Host settings</h2>
+          <p>Changes apply to this Linux host. Network, firewall, and SSH settings are not changed here.</p></div>
+          <Button variant="outline" className="outline-button" disabled={busy} onClick={() => void refresh()}>
+            <RefreshCw size={14} /> Refresh
+          </Button></div>
+        <form className="user-create-form" onSubmit={(event) => void save(event)}>
+          <label>Hostname<input value={hostname} onChange={(event) => setHostname(event.target.value)}
+            pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+            maxLength={253} required /></label>
+          <label>Timezone<input value={timezone} onChange={(event) => setTimezone(event.target.value)}
+            placeholder="Europe/London" maxLength={128} required /></label>
+          <Button className="primary-button" disabled={busy || !hostname.trim() || !timezone.trim()}>Save host settings</Button>
+        </form>
+        <p className="quota-footnote">Use an installed IANA timezone such as <code>Europe/London</code>. Hostname/timezone changes do not require a reboot.</p>
+        {!settings && !error && <div className="management-empty">Loading host settings…</div>}
+      </section>
+      <section className="panel">
+        <div className="panel-heading"><div><h2>Service status</h2>
+          <p>Only ASNS Core and Samba have restart actions. Restarting Core may briefly interrupt this page.</p></div></div>
+        {services.length === 0 ? <div className="management-empty">Service status is not available.</div> :
+          <div className="managed-user-list">{services.map((service) => (
+            <article className="managed-user-row" key={service.name}>
+              <div><strong>{service.name}</strong><small>{service.activeState} · {service.subState}</small></div>
+              {(service.name === "asns.service" || service.name === "smbd.service") &&
+                <Button variant="outline" className="outline-button" disabled={busy} onClick={() => void restart(service.name)}>
+                  Restart
+                </Button>}
+            </article>
+          ))}</div>}
+      </section>
+    </div>
+  );
+}
+
 function StoragePage({ disks, health, smartError, raidArrays, raidError, error, onRefresh }: {
   disks: Disk[];
   health: DiskHealth[];
@@ -1629,6 +1749,7 @@ function ComingSoonPage({ page }: { page: Page }) {
     Monitoring: "Review live CPU, memory, and network samples collected directly from Linux.",
     Users: "Manage local ASNS accounts, roles, and active sessions.",
     Backups: "Configure destinations, scheduled jobs, and restore points.",
+    "System settings": "Manage host identity, timezone, and service status.",
   };
   return (
     <section className="coming-soon">

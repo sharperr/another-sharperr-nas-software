@@ -1,4 +1,4 @@
-import type { BackupArchive, BackupSettings, Disk, DiskHealth, Identity, ManagedUser, MetricSample, RAIDArray, RestoreJob, RestoreStage, SMBPermission, SMBShare, SMBUser, StorageListing, SystemSnapshot } from "../types/system";
+import type { BackupArchive, BackupSettings, Disk, DiskHealth, Identity, ManagedUser, MetricSample, RAIDArray, RestoreJob, RestoreStage, ServiceStatus, SMBPermission, SMBShare, SMBUser, StorageListing, SystemSettings, SystemSnapshot } from "../types/system";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -34,6 +34,19 @@ export const api = {
   disks: () => request<{ disks: Disk[] }>("/api/v1/disks"),
   diskHealth: () => request<{ disks: DiskHealth[] }>("/api/v1/disks/smart"),
   raidArrays: () => request<{ arrays: RAIDArray[] }>("/api/v1/raid"),
+  systemSettings: () => request<SystemSettings>("/api/v1/system/settings"),
+  updateSystemSettings: (settings: Partial<SystemSettings>, csrfToken: string) =>
+    request<SystemSettings>("/api/v1/system/settings", {
+      method: "PUT",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify(settings),
+    }),
+  services: () => request<{ services: ServiceStatus[] }>("/api/v1/services"),
+  restartService: (name: string, csrfToken: string) =>
+    request<void>(`/api/v1/services/${encodeURIComponent(name)}/restart`, {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken },
+    }),
   monitoringHistory: (hours: number) =>
     request<{ hours: number; samples: MetricSample[] }>(`/api/v1/monitoring/history?hours=${hours}`),
   backups: () => request<{ settings: BackupSettings; archives: BackupArchive[] }>("/api/v1/backups"),

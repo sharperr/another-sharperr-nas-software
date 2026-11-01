@@ -111,6 +111,17 @@ export interface RAIDArray {
   detailError?: string;
 }
 
+export interface SystemSettings {
+  hostname: string;
+  timezone: string;
+}
+
+export interface ServiceStatus {
+  name: string;
+  activeState: string;
+  subState: string;
+}
+
 export interface ManagedUser {
   id: number;
   username: string;

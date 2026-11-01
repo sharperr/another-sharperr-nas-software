@@ -35,10 +35,14 @@ On interactive first install, the installer prompts for and confirms an administ
 
 Administrators can create standard users, review measured usage, and assign byte-based quotas. A zero quota means unlimited. ASNS-managed private storage lives in `/var/lib/asns/users/<user-id>` and each account is confined to its own root. Uploads through ASNS are rejected before writing if they exceed the configured limit. These quotas are not Linux filesystem quotas and do not account for SMB or operating-system files.
 
+## System settings
+
+The administrator-only Settings page reads the host hostname, IANA timezone, and the active/substate of the fixed ASNS Core, Agent, and Samba systemd units. Hostname changes use `hostnamectl`; timezone changes are restricted to installed zoneinfo entries and use `timedatectl`. Restart is limited to ASNS Core and Samba. No arbitrary systemd unit, SSH configuration, network, or firewall changes are exposed.
+
 ## Frontend, install, and scope
 
-Vite runs independently in development and proxies `/api` to Core. Production assets are served by Core. The Debian installer clones or fast-forward updates the GitHub `main` branch, installs Go, Node.js/npm, Samba, and `smartmontools`, builds the frontend/Core/Agent/CLI, and installs systemd services. The `asns` CLI supports `help`, `health`, and `launch`. Core binds to loopback by default; remote access should use SSH port forwarding or a TLS-terminating reverse proxy.
+Vite runs independently in development and proxies `/api` to Core. Production assets are served by Core. The Debian installer clones or fast-forward updates the GitHub `main` branch, installs Go, Node.js/npm, Samba, mdadm, and `smartmontools`, builds the frontend/Core/Agent/CLI, and installs systemd services. The `asns` CLI supports `help`, `health`, and `launch`. The installer binds Core to `0.0.0.0:8080` for direct access from the trusted LAN; manually launched Core remains loopback-bound by default. The installer enables Samba for direct SMB connections on TCP 445. Administrators must allow ports 8080 and 445 from their trusted LAN in any active firewall and must not expose plain HTTP or SMB directly to the public Internet; use a VPN or a TLS-terminating reverse proxy for remote access.
 
 Normal uninstall disables and removes Core and Agent, removes the ASNS Samba configuration, and preserves ASNS data, backup archives, share files, Agent state, and configuration. Confirmed `--purge` additionally removes these ASNS data directories. It does not uninstall Debian packages or the Samba service.
 
-Docker applications/plugins, filesystem and mount management, RAID creation/management, ZFS/Btrfs configuration, and WebSockets are not implemented. Applications remain intentionally deferred; no application catalog or container controls are presented as functional.
+SFTP user management, remote CIFS mounts, rsync jobs, Kubernetes, Docker applications/plugins, filesystem and mount management, RAID creation/management, ZFS/Btrfs configuration, and WebSockets are not implemented yet. Kubernetes was deferred by request. No app catalog, transfer service, or container controls are presented as functional.

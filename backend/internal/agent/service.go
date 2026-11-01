@@ -175,6 +175,10 @@ func (s *Service) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /v1/smart", s.smartStatus)
 	mux.HandleFunc("GET /v1/raid", s.raidStatus)
+	mux.HandleFunc("GET /v1/system/settings", s.systemSettings)
+	mux.HandleFunc("PUT /v1/system/settings", s.updateSystemSettings)
+	mux.HandleFunc("GET /v1/services", s.servicesStatus)
+	mux.HandleFunc("POST /v1/services/{name}/restart", s.restartService)
 	mux.HandleFunc("GET /v1/shares", s.listShares)
 	mux.HandleFunc("POST /v1/shares", s.createShare)
 	mux.HandleFunc("PUT /v1/shares/{id}", s.updateShare)
@@ -186,6 +190,161 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/restore/apply", s.startRestore)
 	mux.HandleFunc("GET /v1/restore/{id}", s.getRestore)
 	return mux
+}
+
+type serviceStatus struct {
+	Name        string `json:"name"`
+	ActiveState string `json:"activeState"`
+	SubState    string `json:"subState"`
+}
+
+type systemSettings struct {
+	Hostname string          `json:"hostname"`
+	Timezone string          `json:"timezone"`
+	Services []serviceStatus `json:"services"`
+}
+
+func (s *Service) systemSettings(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.readSystemSettings(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Service) readSystemSettings(ctx context.Context) (systemSettings, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return systemSettings{}, fmt.Errorf("read system hostname: %w", err)
+	}
+	outputRunner, ok := s.run.(commandOutputRunner)
+	if !ok {
+		return systemSettings{}, errors.New("system settings command output is unavailable")
+	}
+	output, err := outputRunner.Output(ctx, "timedatectl", []string{"show", "--property=Timezone", "--value"})
+	if err != nil {
+		return systemSettings{}, fmt.Errorf("read system timezone: %w", err)
+	}
+	return systemSettings{Hostname: hostname, Timezone: strings.TrimSpace(string(output))}, nil
+}
+
+func (s *Service) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Hostname *string `json:"hostname"`
+		Timezone *string `json:"timezone"`
+	}
+	if err := decodeRequest(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if request.Hostname == nil && request.Timezone == nil {
+		writeError(w, http.StatusBadRequest, errors.New("provide a hostname or timezone to update"))
+		return
+	}
+	if request.Hostname != nil {
+		if !validHostname(*request.Hostname) {
+			writeError(w, http.StatusBadRequest, errors.New("hostname must be a valid DNS hostname"))
+			return
+		}
+	}
+	if request.Timezone != nil && !validTimezone(*request.Timezone) {
+		writeError(w, http.StatusBadRequest, errors.New("timezone must name an installed zoneinfo timezone"))
+		return
+	}
+	if request.Hostname != nil {
+		if err := s.run.Run(r.Context(), "hostnamectl", []string{"set-hostname", *request.Hostname}, ""); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("set system hostname: %w", err))
+			return
+		}
+	}
+	if request.Timezone != nil {
+		if err := s.run.Run(r.Context(), "timedatectl", []string{"set-timezone", *request.Timezone}, ""); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("set system timezone: %w", err))
+			return
+		}
+	}
+	settings, err := s.readSystemSettings(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Service) servicesStatus(w http.ResponseWriter, r *http.Request) {
+	outputRunner, ok := s.run.(commandOutputRunner)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, errors.New("service status command is unavailable"))
+		return
+	}
+	names := []string{"asns.service", "asns-agent.service", "smbd.service"}
+	result := make([]serviceStatus, 0, len(names))
+	for _, name := range names {
+		output, err := outputRunner.Output(r.Context(), "systemctl", []string{
+			"show", "--property=ActiveState", "--property=SubState", "--value", name,
+		})
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("read %s status: %w", name, err))
+			return
+		}
+		fields := strings.Fields(string(output))
+		status := serviceStatus{Name: name, ActiveState: "unknown", SubState: "unknown"}
+		if len(fields) > 0 {
+			status.ActiveState = fields[0]
+		}
+		if len(fields) > 1 {
+			status.SubState = fields[1]
+		}
+		result = append(result, status)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"services": result})
+}
+
+func (s *Service) restartService(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name != "asns.service" && name != "smbd.service" {
+		writeError(w, http.StatusBadRequest, errors.New("service is not managed by ASNS"))
+		return
+	}
+	if err := s.run.Run(r.Context(), "systemctl", []string{"restart", name}, ""); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("restart %s: %w", name, err))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func validHostname(hostname string) bool {
+	if len(hostname) < 1 || len(hostname) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(hostname, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+				character >= '0' && character <= '9' || character == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validTimezone(timezone string) bool {
+	if len(timezone) == 0 || len(timezone) > 128 || strings.HasPrefix(timezone, "/") || strings.Contains(timezone, "..") {
+		return false
+	}
+	for _, character := range timezone {
+		if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '/' || character == '_' ||
+			character == '-' || character == '+') {
+			return false
+		}
+	}
+	info, err := os.Stat(filepath.Join("/usr/share/zoneinfo", filepath.Clean(timezone)))
+	return err == nil && info.Mode().IsRegular()
 }
 
 func (s *Service) Initialize(ctx context.Context) error {

@@ -83,6 +83,10 @@ func NewServer(store *database.Store, authService *auth.Service, monitor *monito
 	mux.Handle("GET /api/v1/disks", h.requireAuth(http.HandlerFunc(h.disks)))
 	mux.Handle("GET /api/v1/disks/smart", h.requireAuth(http.HandlerFunc(h.diskHealth)))
 	mux.Handle("GET /api/v1/raid", h.requireAuth(http.HandlerFunc(h.raidStatus)))
+	mux.Handle("GET /api/v1/system/settings", h.requireAdmin(http.HandlerFunc(h.systemSettings)))
+	mux.Handle("PUT /api/v1/system/settings", h.requireAdmin(http.HandlerFunc(h.updateSystemSettings)))
+	mux.Handle("GET /api/v1/services", h.requireAdmin(http.HandlerFunc(h.servicesStatus)))
+	mux.Handle("POST /api/v1/services/{name}/restart", h.requireAdmin(http.HandlerFunc(h.restartService)))
 	mux.Handle("GET /api/v1/monitoring/history", h.requireAuth(http.HandlerFunc(h.monitoringHistory)))
 	mux.Handle("GET /api/v1/backups", h.requireAdmin(http.HandlerFunc(h.listBackups)))
 	mux.Handle("DELETE /api/v1/backups/{name}", h.requireAdmin(http.HandlerFunc(h.deleteBackup)))
@@ -235,6 +239,75 @@ func (h *Handler) raidStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"arrays": arrays})
+}
+
+func (h *Handler) systemSettings(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	settings, err := h.shareAgent.SystemSettings(r.Context())
+	if err != nil {
+		log.Printf("ASNS system settings unavailable: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "system settings are unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (h *Handler) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request struct {
+		Hostname *string `json:"hostname"`
+		Timezone *string `json:"timezone"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	settings, err := h.shareAgent.UpdateSystemSettings(r.Context(), request.Hostname, request.Timezone)
+	if err != nil {
+		log.Printf("ASNS system settings update failed: %v", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (h *Handler) servicesStatus(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	services, err := h.shareAgent.Services(r.Context())
+	if err != nil {
+		log.Printf("ASNS service status unavailable: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "service status is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"services": services})
+}
+
+func (h *Handler) restartService(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	name := r.PathValue("name")
+	if name != "asns.service" && name != "smbd.service" {
+		writeError(w, http.StatusBadRequest, "service is not managed by ASNS")
+		return
+	}
+	if err := h.shareAgent.RestartService(r.Context(), name); err != nil {
+		log.Printf("ASNS service restart failed for %s: %v", name, err)
+		writeError(w, http.StatusServiceUnavailable, "service could not be restarted")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) monitoringHistory(w http.ResponseWriter, r *http.Request) {

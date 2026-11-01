@@ -15,6 +15,7 @@ import (
 type testCommandRunner struct {
 	calls    []string
 	failName string
+	outputs  map[string][]byte
 }
 
 func (r *testCommandRunner) Run(_ context.Context, name string, args []string, _ string) error {
@@ -29,6 +30,9 @@ func (r *testCommandRunner) Output(_ context.Context, name string, args []string
 	r.calls = append(r.calls, name+" "+strings.Join(args, " "))
 	if name == r.failName {
 		return nil, errors.New("injected command failure")
+	}
+	if output, ok := r.outputs[name]; ok {
+		return output, nil
 	}
 	return []byte("MD_STATE=clean\n"), nil
 }
@@ -165,6 +169,69 @@ func TestRaidStatusUsesOnlyReadOnlyMdadmDetail(t *testing.T) {
 	}
 	if len(result.Arrays) != 1 || result.Arrays[0].MdadmState != "clean" {
 		t.Fatalf("unexpected RAID response: %+v", result)
+	}
+}
+
+func TestSystemSettingsRejectInvalidInputsBeforeChangingHost(t *testing.T) {
+	service := NewService(filepath.Join(t.TempDir(), "state.json"), filepath.Join(t.TempDir(), "shares"),
+		filepath.Join(t.TempDir(), "smb.conf"), filepath.Join(t.TempDir(), "asns-shares.conf"))
+	runner := &testCommandRunner{}
+	service.run = runner
+	body := `{"hostname":"nas-home","timezone":"../../etc/passwd"}`
+	response := httptest.NewRecorder()
+	service.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/v1/system/settings", strings.NewReader(body)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid timezone returned %d: %s", response.Code, response.Body.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("invalid request executed system changes: %v", runner.calls)
+	}
+}
+
+func TestSystemSettingsValidateHostnameAndAllowOnlyManagedServices(t *testing.T) {
+	for _, hostname := range []string{"", "-invalid", "invalid-", "nas home", "nas;reboot"} {
+		if validHostname(hostname) {
+			t.Errorf("accepted invalid hostname %q", hostname)
+		}
+	}
+	for _, hostname := range []string{"nas", "nas-01", "nas.home.lan"} {
+		if !validHostname(hostname) {
+			t.Errorf("rejected valid hostname %q", hostname)
+		}
+	}
+	service := NewService(filepath.Join(t.TempDir(), "state.json"), filepath.Join(t.TempDir(), "shares"),
+		filepath.Join(t.TempDir(), "smb.conf"), filepath.Join(t.TempDir(), "asns-shares.conf"))
+	runner := &testCommandRunner{}
+	service.run = runner
+	response := httptest.NewRecorder()
+	service.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/services/ssh.service/restart", nil))
+	if response.Code != http.StatusBadRequest || len(runner.calls) != 0 {
+		t.Fatalf("unmanaged service restart was not rejected safely: status=%d calls=%v", response.Code, runner.calls)
+	}
+}
+
+func TestServicesStatusReturnsOnlyAllowlistedUnits(t *testing.T) {
+	service := NewService(filepath.Join(t.TempDir(), "state.json"), filepath.Join(t.TempDir(), "shares"),
+		filepath.Join(t.TempDir(), "smb.conf"), filepath.Join(t.TempDir(), "asns-shares.conf"))
+	runner := &testCommandRunner{outputs: map[string][]byte{"systemctl": []byte("active\nrunning\n")}}
+	service.run = runner
+	response := httptest.NewRecorder()
+	service.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/services", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("service status returned %d: %s", response.Code, response.Body.String())
+	}
+	want := []string{
+		"systemctl show --property=ActiveState --property=SubState --value asns.service",
+		"systemctl show --property=ActiveState --property=SubState --value asns-agent.service",
+		"systemctl show --property=ActiveState --property=SubState --value smbd.service",
+	}
+	if len(runner.calls) != len(want) {
+		t.Fatalf("unexpected status calls: %v", runner.calls)
+	}
+	for index := range want {
+		if runner.calls[index] != want[index] {
+			t.Fatalf("status call %d = %q, want %q", index, runner.calls[index], want[index])
+		}
 	}
 }
 

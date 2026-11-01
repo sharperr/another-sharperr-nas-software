@@ -17,6 +17,17 @@ type Client struct {
 	http   *http.Client
 }
 
+type ServiceStatus struct {
+	Name        string `json:"name"`
+	ActiveState string `json:"activeState"`
+	SubState    string `json:"subState"`
+}
+
+type SystemSettings struct {
+	Hostname string `json:"hostname"`
+	Timezone string `json:"timezone"`
+}
+
 func NewClient(socket string) *Client {
 	return &Client{
 		socket: socket,
@@ -59,6 +70,37 @@ func (c *Client) RAIDArrays(ctx context.Context) ([]RAIDArray, error) {
 		return nil, err
 	}
 	return response.Arrays, nil
+}
+
+func (c *Client) SystemSettings(ctx context.Context) (SystemSettings, error) {
+	var settings SystemSettings
+	err := c.request(ctx, http.MethodGet, "/v1/system/settings", nil, &settings)
+	return settings, err
+}
+
+func (c *Client) UpdateSystemSettings(ctx context.Context, hostname, timezone *string) (SystemSettings, error) {
+	request := map[string]*string{}
+	if hostname != nil {
+		request["hostname"] = hostname
+	}
+	if timezone != nil {
+		request["timezone"] = timezone
+	}
+	var settings SystemSettings
+	err := c.request(ctx, http.MethodPut, "/v1/system/settings", request, &settings)
+	return settings, err
+}
+
+func (c *Client) Services(ctx context.Context) ([]ServiceStatus, error) {
+	var response struct {
+		Services []ServiceStatus `json:"services"`
+	}
+	err := c.request(ctx, http.MethodGet, "/v1/services", nil, &response)
+	return response.Services, err
+}
+
+func (c *Client) RestartService(ctx context.Context, name string) error {
+	return c.request(ctx, http.MethodPost, "/v1/services/"+url.PathEscape(name)+"/restart", nil, nil)
 }
 
 func (c *Client) CreateShare(ctx context.Context, name string, permissions []Permission) (Share, error) {

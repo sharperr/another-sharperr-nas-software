@@ -12,15 +12,19 @@ set -o pipefail && curl -fsSL https://raw.githubusercontent.com/sharperr/another
 
 Do not use `sudo` when already logged in as root. If you are a non-root user and `sudo` is installed, use `... | sudo bash` instead. The installer installs Git and the build dependencies (Go and Node.js/npm), clones the repository's `main` branch into `/opt/asns/source` on first install, and runs `git pull --ff-only origin main` on subsequent installs. It then downloads Go modules, installs npm dependencies, builds the frontend and Go API/CLI, installs the frontend and API under `/opt/asns`, installs the `asns` CLI in `/usr/local/bin`, creates a dedicated unprivileged service account, and enables the systemd service. Updates stop rather than overwrite a source checkout with local modifications. Review the [installer script](https://github.com/sharperr/another-sharperr-nas-software/blob/main/deployment/scripts/install.sh) before running it as root. On first install, the script securely prompts you to set and confirm an administrator password of 12-72 supported characters; it does not generate or print a password. For unattended installs, set `ASNS_ADMIN_PASSWORD` in the environment. The password is temporarily stored in the root-owned service configuration for first startup and removed after successful setup. Reinstalling preserves the existing configuration and database.
 
-The service listens on `127.0.0.1:8080` on the NAS itself. To check it from the NAS, use `curl -i http://127.0.0.1:8080/` or `asns health`; `ping` does not test TCP ports, and `ping 127.0.0.1:8080` is not a valid ping target.
+The installer configures the web service to listen on all network interfaces at port 8080. Open `http://<nas-ip>:8080` from a computer on your trusted LAN; the installer prints the NAS addresses it detects. To check it on the NAS, use `curl -i http://127.0.0.1:8080/` or `asns health`; `ping` does not test TCP ports. Existing installs using the previous default `127.0.0.1:8080` are migrated to the LAN-accessible default on update; custom bind addresses are preserved.
 
-To open the dashboard from your computer without exposing the HTTP service to the LAN, open a second terminal on your computer and create an SSH tunnel:
+The web UI uses plain HTTP, so only use it on a trusted LAN. Allow TCP port 8080 from your LAN in any active firewall, and do not forward it from your router to the public Internet. For remote access, use a VPN or a TLS-terminating reverse proxy.
 
-```sh
-ssh -L 8080:127.0.0.1:8080 root@192.168.0.15
-```
+### SMB file shares
 
-Keep that SSH session open, then visit <http://127.0.0.1:8080> in your computer's browser. If local port 8080 is already in use on your computer, use `ssh -L 8081:127.0.0.1:8080 root@192.168.0.15` and visit <http://127.0.0.1:8081>. For access without an SSH tunnel, configure a TLS-terminating reverse proxy; do not expose the HTTP service directly to an untrusted network.
+In the ASNS **Sharing** page, create an SMB account and share, then grant that account read or write access. SMB credentials are separate from the ASNS web login. Connect from a device on your LAN using:
+
+- **Windows:** enter `\\<nas-ip>\<share-name>` in File Explorer. When prompted, use the SMB username and password you created in ASNS.
+- **macOS:** in Finder choose **Go → Connect to Server**, then enter `smb://<nas-ip>/<share-name>`.
+- **Linux:** use `smb://<nas-ip>/<share-name>` in a file manager or `smbclient //<nas-ip>/<share-name> -U <smb-username>`.
+
+Allow TCP port 445 from your trusted LAN in any active firewall. Direct IP connections do not require SSH or SMB network discovery.
 
 ### CLI
 
@@ -45,7 +49,7 @@ To delete ASNS configuration, database, backups, Agent state, and share files as
 - Go 1.23 or newer
 - Node.js 20.19 or newer, or 22.12 or newer, with npm
 
-The installer checks these versions. It does not configure disk mounts, partitions, SMART, or network-facing TLS.
+The installer checks these versions and installs/enables Samba, mdadm, and smartmontools. It does not configure disk mounts, partitions, firewall rules, or network-facing TLS.
 
 ## Full-stack development
 
@@ -78,7 +82,7 @@ cd ../backend && GOWORK=off go build -trimpath -o ../asns-server ./cmd/asns
 cd ../backend && GOWORK=off go build -trimpath -o ../asns ./cmd/asnsctl
 ```
 
-The server serves `frontend/dist` when `ASNS_WEB_DIR` points to that directory. Configure `ASNS_DB_PATH` to a persistent SQLite file. The server defaults to `127.0.0.1:8080`; set `ASNS_COOKIE_SECURE=true` when HTTPS is terminated in front of it. To create the initial administrator, provide `ASNS_ADMIN_USERNAME` and `ASNS_ADMIN_PASSWORD` on first startup; the password must be 12-72 supported characters. Remove those variables after the first account is created.
+The server serves `frontend/dist` when `ASNS_WEB_DIR` points to that directory. Configure `ASNS_DB_PATH` to a persistent SQLite file. The online installer sets `ASNS_ADDR=0.0.0.0:8080` for LAN access; manually installed services retain the backend's loopback default unless configured. Set `ASNS_COOKIE_SECURE=true` when HTTPS is terminated in front of it. To create the initial administrator, provide `ASNS_ADMIN_USERNAME` and `ASNS_ADMIN_PASSWORD` on first startup; the password must be 12-72 supported characters. Remove those variables after the first account is created.
 
 The service unit is [deployment/systemd/asns.service](./deployment/systemd/asns.service). It runs as a dedicated `asns` user with systemd filesystem protections. Never run the web process as root.
 
@@ -95,6 +99,8 @@ The service unit is [deployment/systemd/asns.service](./deployment/systemd/asns.
 - `GET /api/v1/monitoring/history?hours=24` — persisted CPU, memory, and network samples (up to 168 hours).
 - `/api/v1/backups` — administrator backup listing, scheduling, manual creation/deletion, and staged, confirmed restore.
 - `/api/v1/shares` and `/api/v1/smb-users` — administrator SMB share and separate SMB-account management through the restricted Agent.
+- `/api/v1/system/settings` — administrator hostname and IANA timezone read/update.
+- `GET /api/v1/services` and `POST /api/v1/services/{name}/restart` — allowlisted service status and restart for ASNS Core and Samba.
 - `GET/POST /api/v1/users` — administrator-only account listing and creation, including measured storage usage and quota.
 - `PUT /api/v1/users/{id}/quota` — administrator-only storage limit update; `0` means unlimited.
 - `/api/v1/files` — authenticated per-user file listing, upload, download, folder creation, and deletion. Uploads are rejected if they exceed the account quota.
@@ -113,6 +119,8 @@ Monitoring history is sampled every 10 seconds and retained for seven days. Back
 
 SMB accounts use separate credentials from ASNS web users. Shares expose only ASNS-created folders under `/srv/asns/shares`, and removing a share preserves its files. SMART health uses `smartctl` and availability depends on the storage controller and disk. mdadm RAID status reports arrays already assembled by Linux; ASNS does not create, assemble, reshape, or otherwise modify RAID arrays.
 
-Not implemented in this release: Docker applications/plugins, filesystem and mount management, RAID creation/management, ZFS/Btrfs, account roles beyond administrator and standard user, and WebSockets. Monitoring refresh uses authenticated REST polling.
+System settings currently support hostname, installed IANA timezone, and status/restart for ASNS Core and Samba. Network, firewall, SSH, and arbitrary systemd unit changes are intentionally not exposed.
+
+Not implemented in this release: SFTP user management, remote CIFS mounting, rsync jobs, Kubernetes, Docker applications/plugins, filesystem and mount management, RAID creation/management, ZFS/Btrfs, account roles beyond administrator and standard user, and WebSockets. Monitoring refresh uses authenticated REST polling.
 
 This development workspace may be used on Windows, but the live monitor reads Linux procfs/sysfs and therefore requires a Linux host to display system metrics. No Windows demonstration values are generated.

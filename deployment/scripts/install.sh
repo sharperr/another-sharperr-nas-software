@@ -106,13 +106,19 @@ for key in ASNS_WEB_DIR ASNS_DB_PATH ASNS_ADDR ASNS_COOKIE_SECURE; do
   case "${key}" in
     ASNS_WEB_DIR) value="${APP_DIR}/frontend/dist" ;;
     ASNS_DB_PATH) value="${DATA_DIR}/asns.db" ;;
-    ASNS_ADDR) value="127.0.0.1:8080" ;;
+    ASNS_ADDR) value="0.0.0.0:8080" ;;
     ASNS_COOKIE_SECURE) value="false" ;;
   esac
   if ! has_setting "${key}" || [[ -z "$(get_setting "${key}")" ]]; then
     set_setting "${key}" "${value}"
   fi
 done
+
+# The earlier installer bound the web service to loopback by default. Move
+# that known default to all interfaces while preserving custom bind addresses.
+if [[ "$(get_setting ASNS_ADDR)" == "127.0.0.1:8080" ]]; then
+  set_setting ASNS_ADDR "0.0.0.0:8080"
+fi
 
 database_path="$(get_setting ASNS_DB_PATH)"
 case "${database_path}" in
@@ -242,10 +248,14 @@ fi
 "${CLI_FILE}" health
 
 printf '\nASNS 0.1.0 is installed and enabled.\n'
-printf 'Dashboard on the NAS: http://127.0.0.1:8080\n'
-printf 'From your computer, run: ssh -L 8080:127.0.0.1:8080 root@<nas-address>\n'
-printf 'Then open http://127.0.0.1:8080 in your computer browser; keep the SSH tunnel open.\n'
+printf 'Dashboard on your LAN: http://<nas-ip>:8080\n'
+lan_addresses="$(hostname -I 2>/dev/null || true)"
+if [[ -n "${lan_addresses}" ]]; then
+  printf 'Detected NAS addresses: %s\n' "${lan_addresses}"
+fi
 printf 'Use curl -i http://127.0.0.1:8080/ on the NAS to test HTTP (ping does not test ports).\n'
+printf 'SMB shares: \\\\<nas-ip>\\<share-name> (TCP port 445); create SMB credentials and shares in the Sharing page.\n'
+printf 'Allow TCP ports 8080 and 445 from your trusted LAN in any active firewall; do not expose them to the Internet.\n'
 printf 'CLI:       asns help | asns health | asns launch\n'
 printf '\nUninstall without deleting NAS data: bash %s/deployment/scripts/uninstall.sh\n' "${SOURCE_DIR}"
 printf 'Uninstall and remove ASNS config/database: bash %s/deployment/scripts/uninstall.sh --purge\n' "${SOURCE_DIR}"
