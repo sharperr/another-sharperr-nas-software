@@ -106,6 +106,8 @@ func NewServer(store *database.Store, authService *auth.Service, monitor *monito
 	mux.Handle("POST /api/v1/users", h.requireAdmin(http.HandlerFunc(h.createUser)))
 	mux.Handle("PUT /api/v1/users/{id}/quota", h.requireAdmin(http.HandlerFunc(h.updateUserQuota)))
 	mux.Handle("GET /api/v1/files", h.requireAuth(http.HandlerFunc(h.listFiles)))
+	mux.Handle("GET /api/v1/sync/manifest", h.requireAuth(http.HandlerFunc(h.syncManifest)))
+	mux.Handle("PUT /api/v1/sync/file", h.requireAuth(http.HandlerFunc(h.replaceSyncFile)))
 	mux.Handle("POST /api/v1/files/upload", h.requireAuth(http.HandlerFunc(h.uploadFile)))
 	mux.Handle("POST /api/v1/files/directory", h.requireAuth(http.HandlerFunc(h.createDirectory)))
 	mux.Handle("GET /api/v1/files/download", h.requireAuth(http.HandlerFunc(h.downloadFile)))
@@ -121,8 +123,16 @@ func secureHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'")
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(secureHeaderWriter{ResponseWriter: w}, r)
 	})
+}
+
+type secureHeaderWriter struct {
+	http.ResponseWriter
+}
+
+func (w secureHeaderWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
@@ -748,6 +758,54 @@ func (h *Handler) listFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) syncManifest(w http.ResponseWriter, r *http.Request) {
+	identity, _ := identityFromContext(r.Context())
+	entries, err := h.storage.Manifest(identity.ID, r.URL.Query().Get("directory"))
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+}
+
+func (h *Handler) replaceSyncFile(w http.ResponseWriter, r *http.Request) {
+	controller := http.NewResponseController(w)
+	if err := controller.SetReadDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		writeError(w, http.StatusInternalServerError, "unable to prepare sync upload")
+		return
+	}
+	if err := controller.SetWriteDeadline(time.Now().Add(30 * time.Minute)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		writeError(w, http.StatusInternalServerError, "unable to prepare sync upload")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, files.MaxUploadBytes)
+	if r.ContentLength < 0 || r.ContentLength > files.MaxUploadBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "sync file size is missing or exceeds the 1 GiB limit")
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	getQuota := func() (int64, error) {
+		user, err := h.store.UserByUsername(r.Context(), identity.Username)
+		if err != nil {
+			return 0, fmt.Errorf("look up upload quota: %w", err)
+		}
+		return user.QuotaBytes, nil
+	}
+	var replaceErr error
+	if r.URL.Query().Has("expectedSha256") {
+		replaceErr = h.storage.ReplaceIfHash(identity.ID, r.URL.Query().Get("path"),
+			r.URL.Query().Get("expectedSha256"), r.ContentLength, getQuota, r.Body)
+	} else {
+		replaceErr = h.storage.Replace(identity.ID, r.URL.Query().Get("path"), r.ContentLength, getQuota, r.Body)
+	}
+	if replaceErr != nil {
+		writeStorageError(w, replaceErr)
+		return
+	}
+	h.recordAudit(r, &identity.ID, "files.sync_replaced")
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, files.MaxUploadBytes+(1<<20))
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
@@ -808,6 +866,11 @@ func (h *Handler) createDirectory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(30 * time.Minute)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		writeError(w, http.StatusInternalServerError, "unable to prepare file download")
+		return
+	}
 	identity, _ := identityFromContext(r.Context())
 	file, info, err := h.storage.Open(identity.ID, r.URL.Query().Get("path"))
 	if err != nil {
@@ -822,8 +885,14 @@ func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) removeFile(w http.ResponseWriter, r *http.Request) {
 	identity, _ := identityFromContext(r.Context())
-	if err := h.storage.Remove(identity.ID, r.URL.Query().Get("path")); err != nil {
-		writeStorageError(w, err)
+	var removeErr error
+	if r.URL.Query().Has("expectedSha256") {
+		removeErr = h.storage.RemoveIfHash(identity.ID, r.URL.Query().Get("path"), r.URL.Query().Get("expectedSha256"))
+	} else {
+		removeErr = h.storage.Remove(identity.ID, r.URL.Query().Get("path"))
+	}
+	if removeErr != nil {
+		writeStorageError(w, removeErr)
 		return
 	}
 	h.recordAudit(r, &identity.ID, "files.deleted")
@@ -834,6 +903,8 @@ func writeStorageError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, files.ErrQuotaExceeded):
 		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+	case errors.Is(err, files.ErrFileChanged):
+		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, files.ErrInvalidPath):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, os.ErrNotExist):

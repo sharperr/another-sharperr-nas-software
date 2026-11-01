@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -201,6 +202,56 @@ func TestAdminUserManagementAndEnforcedStorageQuota(t *testing.T) {
 	}
 	if response := upload("extra.txt", "x"); response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("upload over quota was not rejected: %d %s", response.Code, response.Body.String())
+	}
+	initialHash := fmt.Sprintf("%x", sha256.Sum256([]byte("four")))
+	manifestRequest := httptest.NewRequest(http.MethodGet, "/api/v1/sync/manifest", nil)
+	manifestRequest.AddCookie(userCookie)
+	manifestResponse := httptest.NewRecorder()
+	handler.ServeHTTP(manifestResponse, manifestRequest)
+	if manifestResponse.Code != http.StatusOK || !strings.Contains(manifestResponse.Body.String(), `"path":"file.txt"`) {
+		t.Fatalf("sync manifest did not expose the authenticated user's file: %d %s", manifestResponse.Code, manifestResponse.Body.String())
+	}
+	replace := func(contents string, csrf string, expectedHash string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPut, fmt.Sprintf(
+			"/api/v1/sync/file?path=file.txt&expectedSha256=%s", expectedHash), strings.NewReader(contents))
+		request.Header.Set("Content-Type", "application/octet-stream")
+		if csrf != "" {
+			request.Header.Set("X-CSRF-Token", csrf)
+		}
+		request.AddCookie(userCookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if response := replace("new!", "", initialHash); response.Code != http.StatusForbidden {
+		t.Fatalf("sync replacement without CSRF token should be rejected: %d %s", response.Code, response.Body.String())
+	}
+	if response := replace("new!", userIdentity.CSRF, initialHash); response.Code != http.StatusNoContent {
+		t.Fatalf("sync replacement within quota failed: %d %s", response.Code, response.Body.String())
+	}
+	if response := replace("large", userIdentity.CSRF, initialHash); response.Code != http.StatusConflict {
+		t.Fatalf("stale sync replacement should conflict: %d %s", response.Code, response.Body.String())
+	}
+	newHash := fmt.Sprintf("%x", sha256.Sum256([]byte("new!")))
+	if response := replace("large", userIdentity.CSRF, newHash); response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("sync replacement over quota was not rejected: %d %s", response.Code, response.Body.String())
+	}
+	staleDelete := httptest.NewRequest(http.MethodDelete,
+		fmt.Sprintf("/api/v1/files?path=file.txt&expectedSha256=%s", initialHash), nil)
+	staleDelete.AddCookie(userCookie)
+	staleDelete.Header.Set("X-CSRF-Token", userIdentity.CSRF)
+	staleDeleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleDeleteResponse, staleDelete)
+	if staleDeleteResponse.Code != http.StatusConflict {
+		t.Fatalf("stale sync deletion should conflict: %d %s", staleDeleteResponse.Code, staleDeleteResponse.Body.String())
+	}
+	downloadRequest := httptest.NewRequest(http.MethodGet, "/api/v1/files/download?path=file.txt", nil)
+	downloadRequest.AddCookie(userCookie)
+	downloadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(downloadResponse, downloadRequest)
+	if downloadResponse.Code != http.StatusOK || downloadResponse.Body.String() != "new!" {
+		t.Fatalf("sync replacement content was not available: %d %q", downloadResponse.Code, downloadResponse.Body.String())
 	}
 	updateQuota := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/users/%d/quota", createdUser.ID), strings.NewReader(`{"quotaBytes":8}`))
 	updateQuota.AddCookie(adminCookie)

@@ -45,4 +45,12 @@ Vite runs independently in development and proxies `/api` to Core. Production as
 
 Normal uninstall disables and removes Core and Agent, removes the ASNS Samba configuration, and preserves ASNS data, backup archives, share files, Agent state, and configuration. Confirmed `--purge` additionally removes these ASNS data directories. It does not uninstall Debian packages or the Samba service.
 
+## Desktop sync client
+
+The separate Electron client in `desktop/` supports Windows and Linux builds. It stores profile configuration and hashed synchronization baselines in the local app data directory; ASNS passwords are not persisted, and authentication uses a private Electron cookie session. Files are scanned by SHA-256, with local symbolic links skipped. The authenticated recursive manifest and atomic replacement-upload endpoints keep storage inside the user's ASNS root and enforce that user's quota. Sync uploads and deletions can carry the scanned SHA-256 as a precondition to avoid overwriting/removing a NAS file changed since the scan. Large transfers are streamed and use extended request deadlines.
+
+Profiles map one local folder to one ASNS storage folder and can apply include/exclude glob patterns. New and modified files sync both ways. If both copies differ from their last common baseline, the NAS version wins; overwritten local files are copied to the profile's recovery directory first. Deletions can be propagated both ways only after a confirmation bound to the exact reviewed deletion paths and hashes; scheduled sync never approves deletions. The client must be running for schedules to execute. Directories are created on both ends; directory deletions are not propagated. Transport over HTTP is unencrypted and intended only for a trusted LAN; use HTTPS for other networks.
+
+Build Windows NSIS or Linux AppImage/deb packages from the client platform with `npm ci` and `npm run dist:windows` or `npm run dist:linux` in `desktop/`. The NAS installer intentionally does not install the desktop GUI on the NAS host.
+
 SFTP user management, remote CIFS mounts, rsync jobs, Kubernetes, Docker applications/plugins, filesystem and mount management, RAID creation/management, ZFS/Btrfs configuration, and WebSockets are not implemented yet. Kubernetes was deferred by request. No app catalog, transfer service, or container controls are presented as functional.

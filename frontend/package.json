@@ -8,6 +8,7 @@
     "dev:backend": "cd ../backend && go run ./cmd/asns",
     "dev:all": "concurrently --kill-others --names API,WEB --prefix-colors blue,cyan \"npm:dev:backend\" \"npm:dev\"",
     "build": "tsc -b && vite build",
+    "build:desktop": "tsc -b && vite build --base=./",
     "preview": "vite preview"
   },
   "dependencies": {

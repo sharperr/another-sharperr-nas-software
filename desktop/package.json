@@ -1,0 +1,50 @@
+{
+  "name": "asns-sync",
+  "productName": "ASNS Sync",
+  "version": "0.1.0",
+  "description": "Cross-platform folder synchronization for ASNS",
+  "main": "main.cjs",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron .",
+    "build": "npm --prefix ../frontend run build:desktop",
+    "dist:linux": "npm --prefix ../frontend run build:desktop && electron-builder --linux AppImage deb",
+    "dist:windows": "npm --prefix ../frontend run build:desktop && electron-builder --win nsis",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "electron": "^42.11.18",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.sharperr.asns.sync",
+    "productName": "ASNS Sync",
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "profile-validation.cjs",
+      "sync-engine.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/dist",
+        "to": "frontend"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "linux": {
+      "category": "Network",
+      "target": ["AppImage", "deb"]
+    },
+    "win": {
+      "target": ["nsis"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

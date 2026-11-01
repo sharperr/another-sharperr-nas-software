@@ -26,6 +26,21 @@ In the ASNS **Sharing** page, create an SMB account and share, then grant that a
 
 Allow TCP port 445 from your trusted LAN in any active firewall. Direct IP connections do not require SSH or SMB network discovery.
 
+### ASNS Sync desktop app
+
+ASNS Sync is a separate Windows/Linux desktop client for selected PC folders. It connects to the server with an ASNS account; passwords are not stored, and session cookies stay in the app's private profile. It supports multiple mappings, include/exclude glob patterns, manual or scheduled sync while the client is running, bidirectional file changes, and NAS-wins conflict handling. Before overwriting a changed local file it saves a recovery copy. Deletion propagation is optional, requires review of the exact deletion list, and stores recovery copies before deleting; scheduled sync pauses rather than deleting unattended. Empty directories are copied, but directory deletion is not propagated.
+
+The NAS installer intentionally does not install a desktop GUI on the server. Build the client on the destination platform from the repository; the desktop build uses relative asset URLs so its bundled UI works from Electron's local app resources:
+
+```sh
+cd desktop
+npm ci
+npm run dist:windows  # Windows NSIS installer
+npm run dist:linux    # Linux AppImage and deb
+```
+
+Artifacts are written to `desktop/release`. For development, run `npm run build` then `npm run dev` in `desktop/`, or run Vite separately and set `ASNS_DESKTOP_DEV_URL=http://localhost:5173`. Use HTTPS for connections outside a trusted LAN; plain HTTP credentials and session cookies are not encrypted in transit.
+
 ### CLI
 
 - `asns help` — show available commands.
@@ -94,6 +109,8 @@ The service unit is [deployment/systemd/asns.service](./deployment/systemd/asns.
 - `POST /api/v1/auth/logout` — end session; requires `X-CSRF-Token`.
 - `GET /api/v1/system` — live CPU, memory, network rates, and uptime.
 - `GET /api/v1/disks` — physical block devices discovered through sysfs.
+- `GET /api/v1/sync/manifest` — authenticated recursive file manifest with SHA-256 hashes for the desktop sync client.
+- `PUT /api/v1/sync/file?path=...&expectedSha256=...` — authenticated, CSRF-protected atomic sync upload with storage quota enforcement and a stale-file check (`expectedSha256=` means the path must not exist yet).
 - `GET /api/v1/disks/smart` — SMART health and temperature when supported by the device.
 - `GET /api/v1/raid` — current Linux md RAID health, members, degraded count, and sync progress; read-only.
 - `GET /api/v1/monitoring/history?hours=24` — persisted CPU, memory, and network samples (up to 168 hours).
