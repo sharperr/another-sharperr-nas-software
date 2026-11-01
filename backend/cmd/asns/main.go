@@ -14,6 +14,7 @@ import (
 
 	"github.com/sharperr/asns/backend/internal/api"
 	"github.com/sharperr/asns/backend/internal/auth"
+	"github.com/sharperr/asns/backend/internal/backups"
 	"github.com/sharperr/asns/backend/internal/database"
 	"github.com/sharperr/asns/backend/internal/monitoring"
 )
@@ -43,7 +44,19 @@ func run() error {
 	monitor := monitoring.New("/proc", "/sys")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	monitor.Start(ctx, time.Second)
+	monitor.Start(ctx, time.Second, func(snapshot monitoring.Snapshot) error {
+		writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return store.RecordMetric(writeCtx, database.MetricSample{
+			CollectedAt: snapshot.CollectedAt, CPUPercent: snapshot.CPUPercent,
+			MemoryTotalBytes: snapshot.Memory.TotalBytes, MemoryUsedBytes: snapshot.Memory.UsedBytes,
+			ReceiveBytesPerSecond: snapshot.Network.ReceiveBytesPerSecond,
+			SendBytesPerSecond:    snapshot.Network.SendBytesPerSecond, UptimeSeconds: snapshot.UptimeSeconds,
+		})
+	})
+	userStorageRoot := envOr("ASNS_USER_STORAGE_DIR", filepath.Join(filepath.Dir(dbPath), "users"))
+	backupRoot := envOr("ASNS_BACKUP_DIR", filepath.Join(filepath.Dir(dbPath), "backups"))
+	backups.NewManager(store, dbPath, userStorageRoot, backupRoot).StartScheduler(ctx)
 
 	secureCookie, err := strconv.ParseBool(envOr("ASNS_COOKIE_SECURE", "false"))
 	if err != nil {
@@ -51,7 +64,7 @@ func run() error {
 	}
 
 	handler := api.NewServer(store, auth.NewService(store), monitor, secureCookie, os.Getenv("ASNS_WEB_DIR"),
-		envOr("ASNS_USER_STORAGE_DIR", filepath.Join(filepath.Dir(dbPath), "users")))
+		userStorageRoot, backupRoot, envOr("ASNS_AGENT_SOCKET", "/run/asns-agent/asns-agent.sock"))
 	server := &http.Server{
 		Addr:              envOr("ASNS_ADDR", "127.0.0.1:8080"),
 		Handler:           handler,

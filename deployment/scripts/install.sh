@@ -32,7 +32,8 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates git golang-go nodejs npm
+apt-get install -y --no-install-recommends ca-certificates git golang-go nodejs npm mdadm samba smartmontools
+systemctl enable smbd.service
 
 command -v git >/dev/null 2>&1 || fail "Git installation failed"
 command -v go >/dev/null 2>&1 || fail "Go installation failed"
@@ -178,6 +179,7 @@ printf '\nBuilding the ASNS API and CLI...\n'
   GOWORK=off go mod download
   GOWORK=off go test ./...
   GOWORK=off go build -trimpath -ldflags="-s -w" -o "${build_dir}/asns-server" ./cmd/asns
+  GOWORK=off go build -trimpath -ldflags="-s -w" -o "${build_dir}/asns-agent" ./cmd/agent
   GOWORK=off go build -trimpath -ldflags="-s -w" -o "${build_dir}/asns" ./cmd/asnsctl
 )
 
@@ -188,15 +190,18 @@ if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --gid "${SERVICE_GROUP}" --home-dir "${DATA_DIR}" --no-create-home \
     --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
-install -d -o root -g root -m 0755 "${APP_DIR}" "${APP_DIR}/frontend" "${DATA_DIR}"
+install -d -o root -g root -m 0755 "${APP_DIR}" "${APP_DIR}/frontend" "${DATA_DIR}" /srv/asns/shares
+install -d -o root -g root -m 0700 /var/lib/asns-agent
 chown "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}"
 install -d -o root -g root -m 0755 "${APP_DIR}/frontend/dist"
 find "${APP_DIR}/frontend/dist" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 cp -a "${repo_root}/frontend/dist/." "${APP_DIR}/frontend/dist/"
 chown -R root:root "${APP_DIR}"
 install -o root -g root -m 0755 "${build_dir}/asns-server" "${APP_DIR}/asns-server"
+install -o root -g root -m 0755 "${build_dir}/asns-agent" "${APP_DIR}/asns-agent"
 install -o root -g root -m 0755 "${build_dir}/asns" "${CLI_FILE}"
 install -o root -g root -m 0644 "${repo_root}/deployment/systemd/asns.service" "${UNIT_FILE}"
+install -o root -g root -m 0644 "${repo_root}/deployment/systemd/asns-agent.service" /etc/systemd/system/asns-agent.service
 chown root:"${SERVICE_GROUP}" "${CONFIG_FILE}"
 chmod 0640 "${CONFIG_FILE}"
 
@@ -217,6 +222,7 @@ show_service_logs() {
 }
 
 systemctl daemon-reload
+systemctl enable --now asns-agent.service
 systemctl enable --now "${SERVICE_NAME}"
 
 if ! wait_for_health; then

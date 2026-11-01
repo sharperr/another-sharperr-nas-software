@@ -1,4 +1,4 @@
-import type { Disk, Identity, ManagedUser, StorageListing, SystemSnapshot } from "../types/system";
+import type { BackupArchive, BackupSettings, Disk, DiskHealth, Identity, ManagedUser, MetricSample, RAIDArray, RestoreJob, RestoreStage, SMBPermission, SMBShare, SMBUser, StorageListing, SystemSnapshot } from "../types/system";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -32,6 +32,76 @@ export const api = {
     }),
   system: () => request<SystemSnapshot>("/api/v1/system"),
   disks: () => request<{ disks: Disk[] }>("/api/v1/disks"),
+  diskHealth: () => request<{ disks: DiskHealth[] }>("/api/v1/disks/smart"),
+  raidArrays: () => request<{ arrays: RAIDArray[] }>("/api/v1/raid"),
+  monitoringHistory: (hours: number) =>
+    request<{ hours: number; samples: MetricSample[] }>(`/api/v1/monitoring/history?hours=${hours}`),
+  backups: () => request<{ settings: BackupSettings; archives: BackupArchive[] }>("/api/v1/backups"),
+  deleteBackup: (name: string, csrfToken: string) =>
+    request<void>(`/api/v1/backups/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      headers: { "X-CSRF-Token": csrfToken },
+    }),
+  setBackupSettings: (settings: BackupSettings, csrfToken: string) =>
+    request<BackupSettings>("/api/v1/backups/settings", {
+      method: "PUT",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify(settings),
+    }),
+  runBackup: (csrfToken: string) =>
+    request<void>("/api/v1/backups/run", {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken },
+    }),
+  stageBackupRestore: (name: string, csrfToken: string) =>
+    request<RestoreStage>("/api/v1/backups/restore/stage", {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ name }),
+    }),
+  applyBackupRestore: (id: string, confirmation: string, csrfToken: string) =>
+    request<RestoreJob>("/api/v1/backups/restore/apply", {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ id, confirmation }),
+    }),
+  backupRestoreStatus: (id: string) =>
+    request<RestoreJob>(`/api/v1/backups/restore/${encodeURIComponent(id)}`),
+  shares: () => request<{ shares: SMBShare[]; users: SMBUser[] }>("/api/v1/shares"),
+  createShare: (name: string, permissions: SMBPermission[], csrfToken: string) =>
+    request<SMBShare>("/api/v1/shares", {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ name, permissions }),
+    }),
+  updateShare: (id: string, name: string, permissions: SMBPermission[], csrfToken: string) =>
+    request<SMBShare>(`/api/v1/shares/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ name, permissions }),
+    }),
+  deleteShare: (id: string, csrfToken: string) =>
+    request<void>(`/api/v1/shares/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "X-CSRF-Token": csrfToken },
+    }),
+  createSMBUser: (username: string, password: string, csrfToken: string) =>
+    request<SMBUser>("/api/v1/smb-users", {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ username, password }),
+    }),
+  updateSMBPassword: (username: string, password: string, csrfToken: string) =>
+    request<void>(`/api/v1/smb-users/${encodeURIComponent(username)}/password`, {
+      method: "PUT",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ password }),
+    }),
+  deleteSMBUser: (username: string, csrfToken: string) =>
+    request<void>(`/api/v1/smb-users/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+      headers: { "X-CSRF-Token": csrfToken },
+    }),
   users: () => request<{ users: ManagedUser[] }>("/api/v1/users"),
   createUser: (username: string, password: string, quotaBytes: number, csrfToken: string) =>
     request<ManagedUser>("/api/v1/users", {

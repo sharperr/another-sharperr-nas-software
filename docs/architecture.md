@@ -1,21 +1,44 @@
 # ASNS 0.1.0 architecture
 
-ASNS is a modular monolith: one unprivileged Go process serves the REST API and (when built) the React application. SQLite stores administrator accounts, hashed session identifiers, and authentication audit events.
+ASNS is a modular monolith with a separate privileged helper:
 
-## Initial system integration
+- **Core** is an unprivileged Go process. It serves the REST API and production React application, authenticates users, stores application data in SQLite, and coordinates monitoring and backups.
+- **Agent** is a root-owned Go service with a restricted Unix socket at `/run/asns-agent/asns-agent.sock`. It exposes fixed operations for SMART reads, Samba account/share management, and confirmed restore application. It accepts no shell commands or arbitrary filesystem paths from Core.
 
-The monitoring module reads Linux procfs and sysfs directly. CPU and network rates are calculated from periodic counter samples; memory and uptime are read from procfs; physical block devices are discovered from sysfs. Unsupported or unavailable host data is reported as unavailable, never replaced with demonstration values.
+The Core systemd service runs as the dedicated `asns` account. The Agent is sandboxed by systemd and is not reachable over TCP. Its writable paths include `/etc` because local account tools use atomic sibling-file replacements; this is broader than a file-only allow-list. The Agent's Unix-socket API is therefore deliberately limited to validated account names, fixed Samba operations, known ASNS directories, and fixed service operations.
 
-The web process does not run as root. The systemd unit uses a dedicated `asns` account and filesystem protections. No privileged agent or storage-changing operation is included in this foundation. A future ASNS Agent must expose only an allow-listed, validated Unix-socket API.
+## Monitoring
 
-## Authentication
+CPU, memory, uptime, network counters, and block-device discovery come from Linux procfs/sysfs. The monitoring sampler persists real system samples to SQLite every 10 seconds and retains seven days. The authenticated history endpoint supports up to 168 hours. Unsupported data is returned as unavailable rather than replaced with demonstration values.
 
-On an interactive first install, the installer prompts for and confirms an administrator password using `/dev/tty`, so the prompt works while the script itself is piped from curl. `ASNS_ADMIN_PASSWORD` supports unattended setup. The bootstrap password is kept in the root-owned service environment until the first healthy startup, then removed. Passwords use bcrypt; only SHA-256 hashes of high-entropy session tokens are stored. Sessions expire after 12 hours and use HttpOnly, SameSite cookies. Unsafe requests require the per-session CSRF token. Login attempts are limited per source IP, and authentication events are recorded in SQLite.
+SMART status and temperature are queried from discovered physical block devices through a fixed `smartctl --json -H -A /dev/<validated-device>` invocation. If SMART is unavailable or the device reports no supported health/temperature attributes, the API reports that limitation. The installer installs `smartmontools`; actual disk support depends on the controller and device.
 
-## Frontend
+Software RAID status is read from `/proc/mdstat`; `mdadm --detail --export` supplies read-only array details for arrays the Linux kernel already exposes. The API reports RAID level, state, member devices, active/expected count, degraded state, and synchronization progress when available. The installer installs `mdadm`. ASNS does not create, assemble, reshape, stop, or modify arrays, and does not partition or format disks.
 
-Vite runs independently in development and proxies `/api` to the Go service. A production frontend build can be served by the Go process by setting `ASNS_WEB_DIR` to the build output directory.
+## Backup and restore
 
-The Debian online installer installs Git and the frontend/backend build dependencies, keeps the repository checkout at `/opt/asns/source`, clones `main` on first install, and runs `git pull --ff-only origin main` on updates. It downloads Go modules and installs npm packages before building the UI and API, then installs a systemd unit running as the dedicated unprivileged `asns` account and installs the `asns` CLI. `asns health` checks the API; `asns launch` starts the service if needed and optionally opens a local browser. The service binds to loopback by default; remote browser access can use an SSH local port-forward or a TLS-terminating reverse proxy. Uninstall preserves `/var/lib/asns` and `/etc/asns` unless the operator explicitly requests and confirms `--purge`.
+Backups contain a consistent SQLite snapshot and ASNS-managed private user files. Archives are gzip-compressed tar files with a SHA-256 manifest and restrictive permissions. Before staging restore, archive paths and checksums are validated and the SQLite database is integrity-checked. Applying a staged restore requires administrator confirmation, stops Core, preserves a rollback copy, replaces the database and user files, restarts Core, and checks its health; failure triggers a rollback attempt.
 
-Administrators can create standard accounts, review measured usage, and assign byte-based quotas through the user-management API and UI. A zero quota means unlimited. ASNS-managed storage lives in `/var/lib/asns/users/<user-id>`; each account is confined to its own root. The file manager supports folder creation, upload, download, and removal of files or empty folders. Uploads are serialized with quota changes and rejected before writing if they would exceed the user's configured limit. Quotas cover ASNS-managed files only; they are not Linux filesystem quotas and do not include external SMB or operating-system files.
+The administrator configures a destination relative to `/var/lib/asns/backups` and a schedule interval from 1 to 720 hours. Mount external storage under that directory before selecting it, and ensure the `asns` service account can write there. Backups are retained indefinitely until an administrator deletes them.
+
+Backups currently **exclude** SMB share contents under `/srv/asns/shares`, Agent state/account configuration under `/var/lib/asns-agent`, system configuration, and operating-system files. Restoring therefore does not roll back SMB users or shares.
+
+## SMB sharing and Agent boundary
+
+ASNS-managed shares expose only generated directories below `/srv/asns/shares`. Samba configuration is rendered into `/etc/samba/asns-shares.conf` and included from Samba's global section after `testparm` validation. Shares deny guest access and default to read-only; explicit per-account permissions determine write access.
+
+SMB credentials are separate from ASNS web accounts. Managed SMB usernames use the `asns_` prefix, and their passwords are stored in Samba's account database, not SQLite. Removing a share preserves its files. The Agent manages only fixed Samba operations and a restricted set of SMART/restore actions over its Unix socket.
+
+## Authentication and storage
+
+On interactive first install, the installer prompts for and confirms an administrator password through `/dev/tty`; `ASNS_ADMIN_PASSWORD` supports unattended setup. The bootstrap password is held temporarily in the root-owned service environment and removed after successful initialization. Passwords use bcrypt; only hashes of high-entropy session tokens are stored. Sessions expire after 12 hours and use HttpOnly, SameSite cookies. Unsafe requests require the per-session CSRF token. Login attempts are rate-limited per source IP, and authentication events are recorded in SQLite.
+
+Administrators can create standard users, review measured usage, and assign byte-based quotas. A zero quota means unlimited. ASNS-managed private storage lives in `/var/lib/asns/users/<user-id>` and each account is confined to its own root. Uploads through ASNS are rejected before writing if they exceed the configured limit. These quotas are not Linux filesystem quotas and do not account for SMB or operating-system files.
+
+## Frontend, install, and scope
+
+Vite runs independently in development and proxies `/api` to Core. Production assets are served by Core. The Debian installer clones or fast-forward updates the GitHub `main` branch, installs Go, Node.js/npm, Samba, and `smartmontools`, builds the frontend/Core/Agent/CLI, and installs systemd services. The `asns` CLI supports `help`, `health`, and `launch`. Core binds to loopback by default; remote access should use SSH port forwarding or a TLS-terminating reverse proxy.
+
+Normal uninstall disables and removes Core and Agent, removes the ASNS Samba configuration, and preserves ASNS data, backup archives, share files, Agent state, and configuration. Confirmed `--purge` additionally removes these ASNS data directories. It does not uninstall Debian packages or the Samba service.
+
+Docker applications/plugins, filesystem and mount management, RAID creation/management, ZFS/Btrfs configuration, and WebSockets are not implemented. Applications remain intentionally deferred; no application catalog or container controls are presented as functional.

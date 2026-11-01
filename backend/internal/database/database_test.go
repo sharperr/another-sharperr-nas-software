@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -106,5 +107,30 @@ func TestCreateUserAndUpdateQuota(t *testing.T) {
 	}
 	if updated.QuotaBytes != 8192 {
 		t.Fatalf("expected updated quota 8192, got %d", updated.QuotaBytes)
+	}
+}
+
+func TestMetricHistoryPersistsAndFiltersSamples(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "asns.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC().Truncate(time.Second)
+	cpu := 42.5
+	for _, sample := range []MetricSample{
+		{CollectedAt: now.Add(-time.Hour), CPUPercent: &cpu, MemoryTotalBytes: 100, MemoryUsedBytes: 50},
+		{CollectedAt: now, CPUPercent: nil, MemoryTotalBytes: 200, MemoryUsedBytes: 100},
+	} {
+		if err := store.RecordMetric(context.Background(), sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := store.MetricHistory(context.Background(), now.Add(-time.Minute), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].CollectedAt != now || got[0].CPUPercent != nil || got[0].MemoryTotalBytes != 200 {
+		t.Fatalf("unexpected filtered monitoring samples: %+v", got)
 	}
 }

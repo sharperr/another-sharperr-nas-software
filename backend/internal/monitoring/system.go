@@ -67,13 +67,23 @@ func New(procRoot, sysRoot string) *System {
 	return &System{procRoot: procRoot, sysRoot: sysRoot}
 }
 
-func (s *System) Start(ctx context.Context, interval time.Duration) {
+func (s *System) Start(ctx context.Context, interval time.Duration, onSample ...func(Snapshot) error) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		lastPersisted := time.Time{}
 		for {
 			if err := s.sample(); err != nil {
 				fmt.Fprintf(os.Stderr, "ASNS monitoring sample failed: %v\n", err)
+			} else if len(onSample) > 0 && (lastPersisted.IsZero() || time.Since(lastPersisted) >= 10*time.Second) {
+				snapshot, err := s.Snapshot()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ASNS monitoring snapshot failed: %v\n", err)
+				} else if err := onSample[0](snapshot); err != nil {
+					fmt.Fprintf(os.Stderr, "ASNS monitoring history write failed: %v\n", err)
+				} else {
+					lastPersisted = time.Now()
+				}
 			}
 			select {
 			case <-ctx.Done():

@@ -1,6 +1,6 @@
 # Another Sharperr NAS Software (ASNS)
 
-ASNS is a self-hosted NAS management platform for existing Linux systems—not a replacement operating system. Version **0.1.0** provides a Go REST API, SQLite-backed administrator authentication, live Linux system monitoring, physical disk discovery, a React dashboard, and a small command-line client.
+ASNS is a self-hosted NAS management platform for existing Linux systems—not a replacement operating system. Version **0.1.0** provides a Go REST API, SQLite-backed authentication and history, a React dashboard, real Linux monitoring, `smartctl` disk health, read-only mdadm RAID status, SMB share management, scheduled backups, per-user file storage limits, and a small command-line client. A separate restricted Agent handles selected operations that require elevated privileges. Docker applications are intentionally deferred.
 
 ## One-line install
 
@@ -31,13 +31,13 @@ Keep that SSH session open, then visit <http://127.0.0.1:8080> in your computer'
 
 ### One-line uninstall
 
-Remove the application, service, and CLI while preserving the database and configuration:
+Remove the application, Core/Agent services, Samba integration, and CLI while preserving ASNS data (including backups and share files):
 
 ```sh
 bash /opt/asns/source/deployment/scripts/uninstall.sh
 ```
 
-To delete ASNS configuration and database as well, run `bash /opt/asns/source/deployment/scripts/uninstall.sh --purge` and type `DELETE` at the confirmation prompt. Neither uninstall form removes Debian packages installed for building ASNS.
+To delete ASNS configuration, database, backups, Agent state, and share files as well, run `bash /opt/asns/source/deployment/scripts/uninstall.sh --purge` and type `DELETE` at the confirmation prompt. Neither uninstall form removes Debian packages or the Samba service.
 
 ## Requirements
 
@@ -90,6 +90,11 @@ The service unit is [deployment/systemd/asns.service](./deployment/systemd/asns.
 - `POST /api/v1/auth/logout` — end session; requires `X-CSRF-Token`.
 - `GET /api/v1/system` — live CPU, memory, network rates, and uptime.
 - `GET /api/v1/disks` — physical block devices discovered through sysfs.
+- `GET /api/v1/disks/smart` — SMART health and temperature when supported by the device.
+- `GET /api/v1/raid` — current Linux md RAID health, members, degraded count, and sync progress; read-only.
+- `GET /api/v1/monitoring/history?hours=24` — persisted CPU, memory, and network samples (up to 168 hours).
+- `/api/v1/backups` — administrator backup listing, scheduling, manual creation/deletion, and staged, confirmed restore.
+- `/api/v1/shares` and `/api/v1/smb-users` — administrator SMB share and separate SMB-account management through the restricted Agent.
 - `GET/POST /api/v1/users` — administrator-only account listing and creation, including measured storage usage and quota.
 - `PUT /api/v1/users/{id}/quota` — administrator-only storage limit update; `0` means unlimited.
 - `/api/v1/files` — authenticated per-user file listing, upload, download, folder creation, and deletion. Uploads are rejected if they exceed the account quota.
@@ -104,6 +109,10 @@ Dashboard metrics are read directly from Linux procfs/sysfs; unsupported host in
 
 Per-user quotas apply to files stored in ASNS-managed account folders under `/var/lib/asns/users`; usage is measured from regular file sizes, and uploads through ASNS are blocked at the configured limit. This does not impose Linux filesystem quotas or include files outside ASNS-managed storage.
 
-Not implemented in this release: SMART health/temperatures, filesystem and mount management, SMB, Docker management, persistent metric history, account roles beyond administrator and standard user, backups, privileged agent operations, and WebSockets. Monitoring refresh currently uses authenticated REST polling every three seconds.
+Monitoring history is sampled every 10 seconds and retained for seven days. Backups contain the SQLite database and ASNS private user files; they do not include SMB share files or Agent state. Backup intervals range from 1 to 720 hours, archives are retained until manually deleted, and external destinations must be mounted under `/var/lib/asns/backups`. Restore verifies archive contents and database integrity, then restarts Core and attempts rollback if the restored service is unhealthy.
+
+SMB accounts use separate credentials from ASNS web users. Shares expose only ASNS-created folders under `/srv/asns/shares`, and removing a share preserves its files. SMART health uses `smartctl` and availability depends on the storage controller and disk. mdadm RAID status reports arrays already assembled by Linux; ASNS does not create, assemble, reshape, or otherwise modify RAID arrays.
+
+Not implemented in this release: Docker applications/plugins, filesystem and mount management, RAID creation/management, ZFS/Btrfs, account roles beyond administrator and standard user, and WebSockets. Monitoring refresh uses authenticated REST polling.
 
 This development workspace may be used on Windows, but the live monitor reads Linux procfs/sysfs and therefore requires a Linux host to display system metrics. No Windows demonstration values are generated.

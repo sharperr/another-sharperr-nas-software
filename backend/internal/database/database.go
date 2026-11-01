@@ -15,7 +15,18 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
+}
+
+func (s *Store) RecoverInterruptedBackup(ctx context.Context, now time.Time) error {
+	if _, err := s.db.ExecContext(ctx, `UPDATE backup_settings
+		SET last_status = 'failed', last_error = 'ASNS restarted while the backup was running',
+			next_run_at = ? + interval_hours * 3600
+		WHERE id = 1 AND last_status = 'running'`, now.Unix()); err != nil {
+		return fmt.Errorf("recover interrupted backup status: %w", err)
+	}
+	return nil
 }
 
 type User struct {
@@ -47,7 +58,7 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 
-	store := &Store{db: db}
+	store := &Store{db: db, path: path}
 	if _, err := db.Exec(`
 		PRAGMA journal_mode = WAL;
 		PRAGMA foreign_keys = ON;
@@ -75,6 +86,27 @@ func Open(path string) (*Store, error) {
 			remote_addr TEXT NOT NULL,
 			created_at INTEGER NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS metric_samples (
+			collected_at INTEGER PRIMARY KEY,
+			cpu_percent REAL,
+			memory_total_bytes INTEGER NOT NULL,
+			memory_used_bytes INTEGER NOT NULL,
+			receive_bytes_per_second REAL NOT NULL,
+			send_bytes_per_second REAL NOT NULL,
+			uptime_seconds REAL NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS metric_samples_collected_at ON metric_samples(collected_at);
+		CREATE TABLE IF NOT EXISTS backup_settings (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+			interval_hours INTEGER NOT NULL DEFAULT 24 CHECK (interval_hours BETWEEN 1 AND 720),
+			destination TEXT NOT NULL DEFAULT '',
+			next_run_at INTEGER NOT NULL DEFAULT 0,
+			last_run_at INTEGER NOT NULL DEFAULT 0,
+			last_status TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT ''
+		);
+		INSERT OR IGNORE INTO backup_settings (id) VALUES (1);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize SQLite schema: %w", err)
@@ -88,6 +120,191 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("secure SQLite database file: %w", err)
 	}
 	return store, nil
+}
+
+type MetricSample struct {
+	CollectedAt           time.Time `json:"collectedAt"`
+	CPUPercent            *float64  `json:"cpuPercent"`
+	MemoryTotalBytes      uint64    `json:"memoryTotalBytes"`
+	MemoryUsedBytes       uint64    `json:"memoryUsedBytes"`
+	ReceiveBytesPerSecond float64   `json:"receiveBytesPerSecond"`
+	SendBytesPerSecond    float64   `json:"sendBytesPerSecond"`
+	UptimeSeconds         float64   `json:"uptimeSeconds"`
+}
+
+type BackupSettings struct {
+	Enabled       bool      `json:"enabled"`
+	IntervalHours int       `json:"intervalHours"`
+	Destination   string    `json:"destination"`
+	NextRunAt     time.Time `json:"nextRunAt,omitempty"`
+	LastRunAt     time.Time `json:"lastRunAt,omitempty"`
+	LastStatus    string    `json:"lastStatus"`
+	LastError     string    `json:"lastError,omitempty"`
+}
+
+func (s *Store) BackupSettings(ctx context.Context) (BackupSettings, error) {
+	var settings BackupSettings
+	var enabled int
+	var nextRunAt, lastRunAt int64
+	err := s.db.QueryRowContext(ctx, `SELECT enabled, interval_hours, destination, next_run_at, last_run_at, last_status, last_error
+		FROM backup_settings WHERE id = 1`).Scan(&enabled, &settings.IntervalHours, &settings.Destination,
+		&nextRunAt, &lastRunAt, &settings.LastStatus, &settings.LastError)
+	if err != nil {
+		return BackupSettings{}, fmt.Errorf("read backup settings: %w", err)
+	}
+	settings.Enabled = enabled == 1
+	if nextRunAt > 0 {
+		settings.NextRunAt = time.Unix(nextRunAt, 0).UTC()
+	}
+	if lastRunAt > 0 {
+		settings.LastRunAt = time.Unix(lastRunAt, 0).UTC()
+	}
+	return settings, nil
+}
+
+func (s *Store) SetBackupSettings(ctx context.Context, settings BackupSettings) error {
+	if settings.IntervalHours < 1 || settings.IntervalHours > 720 {
+		return errors.New("backup interval must be between 1 and 720 hours")
+	}
+	nextRunAt := int64(0)
+	if settings.Enabled {
+		nextRunAt = time.Now().Add(time.Duration(settings.IntervalHours) * time.Hour).Unix()
+	}
+	enabled := 0
+	if settings.Enabled {
+		enabled = 1
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE backup_settings SET enabled = ?, interval_hours = ?, destination = ?, next_run_at = ? WHERE id = 1`,
+		enabled, settings.IntervalHours, settings.Destination, nextRunAt); err != nil {
+		return fmt.Errorf("save backup settings: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ClaimDueBackup(ctx context.Context, now time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE backup_settings
+		SET next_run_at = ? + interval_hours * 3600, last_run_at = ?, last_status = 'running', last_error = ''
+		WHERE id = 1 AND enabled = 1 AND next_run_at <= ? AND last_status != 'running'`,
+		now.Unix(), now.Unix(), now.Unix())
+	if err != nil {
+		return false, fmt.Errorf("claim scheduled backup: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check scheduled backup claim: %w", err)
+	}
+	return rows == 1, nil
+}
+
+func (s *Store) ClaimManualBackup(ctx context.Context, now time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE backup_settings
+		SET last_run_at = ?, last_status = 'running', last_error = ''
+		WHERE id = 1 AND last_status != 'running'`, now.Unix())
+	if err != nil {
+		return false, fmt.Errorf("claim manual backup: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check manual backup claim: %w", err)
+	}
+	return rows == 1, nil
+}
+
+func (s *Store) CompleteBackup(ctx context.Context, status, message string) error {
+	if status != "running" && status != "succeeded" && status != "failed" {
+		return errors.New("invalid backup status")
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE backup_settings SET last_status = ?, last_error = ? WHERE id = 1`,
+		status, message); err != nil {
+		return fmt.Errorf("record backup result: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) SnapshotDatabase(ctx context.Context, destination string) error {
+	if destination == "" {
+		return errors.New("database snapshot destination is empty")
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, destination); err != nil {
+		return fmt.Errorf("create consistent SQLite snapshot: %w", err)
+	}
+	snapshot, err := sql.Open("sqlite", destination)
+	if err != nil {
+		return fmt.Errorf("open SQLite snapshot for normalization: %w", err)
+	}
+	defer snapshot.Close()
+	if _, err := snapshot.ExecContext(ctx, `UPDATE backup_settings SET last_status = 'succeeded', last_error = '' WHERE last_status = 'running'`); err != nil {
+		return fmt.Errorf("normalize backup status in SQLite snapshot: %w", err)
+	}
+	return nil
+}
+
+func CheckDatabase(path string) error {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("open SQLite database for integrity check: %w", err)
+	}
+	defer db.Close()
+	var result string
+	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&result); err != nil {
+		return fmt.Errorf("run SQLite integrity check: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("SQLite integrity check returned %q", result)
+	}
+	return nil
+}
+
+func (s *Store) RecordMetric(ctx context.Context, sample MetricSample) error {
+	var cpu any
+	if sample.CPUPercent != nil {
+		cpu = *sample.CPUPercent
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO metric_samples
+		(collected_at, cpu_percent, memory_total_bytes, memory_used_bytes, receive_bytes_per_second, send_bytes_per_second, uptime_seconds)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		sample.CollectedAt.Unix(), cpu, sample.MemoryTotalBytes, sample.MemoryUsedBytes,
+		sample.ReceiveBytesPerSecond, sample.SendBytesPerSecond, sample.UptimeSeconds)
+	if err != nil {
+		return fmt.Errorf("record monitoring sample: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM metric_samples WHERE collected_at < ?`, time.Now().Add(-7*24*time.Hour).Unix()); err != nil {
+		return fmt.Errorf("prune monitoring history: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MetricHistory(ctx context.Context, since time.Time, limit int) ([]MetricSample, error) {
+	if limit < 1 || limit > 100000 {
+		return nil, errors.New("metric history limit is invalid")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT collected_at, cpu_percent, memory_total_bytes, memory_used_bytes,
+		receive_bytes_per_second, send_bytes_per_second, uptime_seconds
+		FROM metric_samples WHERE collected_at >= ? ORDER BY collected_at ASC LIMIT ?`, since.Unix(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("query monitoring history: %w", err)
+	}
+	defer rows.Close()
+	samples := make([]MetricSample, 0)
+	for rows.Next() {
+		var sample MetricSample
+		var collectedAt int64
+		var cpu sql.NullFloat64
+		if err := rows.Scan(&collectedAt, &cpu, &sample.MemoryTotalBytes, &sample.MemoryUsedBytes,
+			&sample.ReceiveBytesPerSecond, &sample.SendBytesPerSecond, &sample.UptimeSeconds); err != nil {
+			return nil, fmt.Errorf("read monitoring sample: %w", err)
+		}
+		sample.CollectedAt = time.Unix(collectedAt, 0).UTC()
+		if cpu.Valid {
+			value := cpu.Float64
+			sample.CPUPercent = &value
+		}
+		samples = append(samples, sample)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate monitoring history: %w", err)
+	}
+	return samples, nil
 }
 
 func migrateUsers(db *sql.DB) (migrationErr error) {
@@ -166,6 +383,10 @@ func migrateUsers(db *sql.DB) (migrationErr error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+func (s *Store) DatabasePath() string {
+	return s.path
 }
 
 func (s *Store) EnsureAdmin(ctx context.Context, username, password string) error {

@@ -21,7 +21,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sharperr/asns/backend/internal/agent"
 	"github.com/sharperr/asns/backend/internal/auth"
+	"github.com/sharperr/asns/backend/internal/backups"
 	"github.com/sharperr/asns/backend/internal/database"
 	"github.com/sharperr/asns/backend/internal/files"
 	"github.com/sharperr/asns/backend/internal/monitoring"
@@ -39,6 +41,8 @@ type Handler struct {
 	audit         auditStore
 	monitor       *monitoring.System
 	storage       *files.Manager
+	backups       *backups.Manager
+	shareAgent    *agent.Client
 	secureCookie  bool
 	webDir        string
 	loginMu       sync.Mutex
@@ -55,9 +59,20 @@ func NewServer(store *database.Store, authService *auth.Service, monitor *monito
 	if len(storageRoots) > 0 && storageRoots[0] != "" {
 		storageRoot = storageRoots[0]
 	}
+	backupRoot := filepath.Join(filepath.Dir(storageRoot), "backups")
+	if len(storageRoots) > 1 && storageRoots[1] != "" {
+		backupRoot = storageRoots[1]
+	}
+	var shareAgent *agent.Client
+	if len(storageRoots) > 2 && storageRoots[2] != "" {
+		shareAgent = agent.NewClient(storageRoots[2])
+	}
 	h := &Handler{
 		auth: authService, store: store, audit: store, monitor: monitor, secureCookie: secureCookie,
-		webDir: webDir, storage: files.NewManager(storageRoot), loginAttempts: make(map[string]loginWindow),
+		webDir: webDir, storage: files.NewManager(storageRoot),
+		backups:       backups.NewManager(store, store.DatabasePath(), storageRoot, backupRoot),
+		shareAgent:    shareAgent,
+		loginAttempts: make(map[string]loginWindow),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", h.health)
@@ -66,6 +81,23 @@ func NewServer(store *database.Store, authService *auth.Service, monitor *monito
 	mux.Handle("GET /api/v1/auth/me", h.requireAuth(http.HandlerFunc(h.me)))
 	mux.Handle("GET /api/v1/system", h.requireAuth(http.HandlerFunc(h.system)))
 	mux.Handle("GET /api/v1/disks", h.requireAuth(http.HandlerFunc(h.disks)))
+	mux.Handle("GET /api/v1/disks/smart", h.requireAuth(http.HandlerFunc(h.diskHealth)))
+	mux.Handle("GET /api/v1/raid", h.requireAuth(http.HandlerFunc(h.raidStatus)))
+	mux.Handle("GET /api/v1/monitoring/history", h.requireAuth(http.HandlerFunc(h.monitoringHistory)))
+	mux.Handle("GET /api/v1/backups", h.requireAdmin(http.HandlerFunc(h.listBackups)))
+	mux.Handle("DELETE /api/v1/backups/{name}", h.requireAdmin(http.HandlerFunc(h.deleteBackup)))
+	mux.Handle("PUT /api/v1/backups/settings", h.requireAdmin(http.HandlerFunc(h.setBackupSettings)))
+	mux.Handle("POST /api/v1/backups/run", h.requireAdmin(http.HandlerFunc(h.runBackup)))
+	mux.Handle("POST /api/v1/backups/restore/stage", h.requireAdmin(http.HandlerFunc(h.stageBackupRestore)))
+	mux.Handle("POST /api/v1/backups/restore/apply", h.requireAdmin(http.HandlerFunc(h.applyBackupRestore)))
+	mux.Handle("GET /api/v1/backups/restore/{id}", h.requireAdmin(http.HandlerFunc(h.backupRestoreStatus)))
+	mux.Handle("GET /api/v1/shares", h.requireAdmin(http.HandlerFunc(h.listShares)))
+	mux.Handle("POST /api/v1/shares", h.requireAdmin(http.HandlerFunc(h.createShare)))
+	mux.Handle("PUT /api/v1/shares/{id}", h.requireAdmin(http.HandlerFunc(h.updateShare)))
+	mux.Handle("DELETE /api/v1/shares/{id}", h.requireAdmin(http.HandlerFunc(h.deleteShare)))
+	mux.Handle("POST /api/v1/smb-users", h.requireAdmin(http.HandlerFunc(h.createSMBUser)))
+	mux.Handle("PUT /api/v1/smb-users/{username}/password", h.requireAdmin(http.HandlerFunc(h.updateSMBPassword)))
+	mux.Handle("DELETE /api/v1/smb-users/{username}", h.requireAdmin(http.HandlerFunc(h.deleteSMBUser)))
 	mux.Handle("GET /api/v1/users", h.requireAdmin(http.HandlerFunc(h.listUsers)))
 	mux.Handle("POST /api/v1/users", h.requireAdmin(http.HandlerFunc(h.createUser)))
 	mux.Handle("PUT /api/v1/users/{id}/quota", h.requireAdmin(http.HandlerFunc(h.updateUserQuota)))
@@ -175,6 +207,359 @@ func (h *Handler) disks(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"disks": disks})
+}
+
+func (h *Handler) diskHealth(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	disks, err := h.shareAgent.DiskHealth(r.Context())
+	if err != nil {
+		log.Printf("ASNS SMART discovery unavailable: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "SMART health is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"disks": disks})
+}
+
+func (h *Handler) raidStatus(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	arrays, err := h.shareAgent.RAIDArrays(r.Context())
+	if err != nil {
+		log.Printf("ASNS RAID status unavailable: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "RAID status is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"arrays": arrays})
+}
+
+func (h *Handler) monitoringHistory(w http.ResponseWriter, r *http.Request) {
+	hours := 24
+	if value := r.URL.Query().Get("hours"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 168 {
+			writeError(w, http.StatusBadRequest, "hours must be between 1 and 168")
+			return
+		}
+		hours = parsed
+	}
+	samples, err := h.store.MetricHistory(r.Context(), time.Now().Add(-time.Duration(hours)*time.Hour), 100000)
+	if err != nil {
+		log.Printf("ASNS monitoring history unavailable: %v", err)
+		writeError(w, http.StatusInternalServerError, "unable to load monitoring history")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hours": hours, "samples": samples})
+}
+
+func (h *Handler) listBackups(w http.ResponseWriter, r *http.Request) {
+	settings, err := h.store.BackupSettings(r.Context())
+	if err != nil {
+		log.Printf("ASNS backup settings unavailable: %v", err)
+		writeError(w, http.StatusInternalServerError, "unable to load backup settings")
+		return
+	}
+	archives, err := h.backups.List(settings.Destination)
+	if err != nil {
+		log.Printf("ASNS backup archive listing failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "unable to list backup archives")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"settings": settings, "archives": archives})
+}
+
+func (h *Handler) deleteBackup(w http.ResponseWriter, r *http.Request) {
+	settings, err := h.store.BackupSettings(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to load backup settings")
+		return
+	}
+	if err := h.backups.Delete(settings.Destination, r.PathValue("name")); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "backups.deleted")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) setBackupSettings(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request database.BackupSettings
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.backups.EnsureDestination(request.Destination); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.store.SetBackupSettings(r.Context(), request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "backups.settings_updated")
+	settings, err := h.store.BackupSettings(r.Context())
+	if err != nil {
+		log.Printf("ASNS backup settings readback failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "backup settings were saved but could not be reloaded")
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (h *Handler) runBackup(w http.ResponseWriter, r *http.Request) {
+	identity, _ := identityFromContext(r.Context())
+	claimed, err := h.store.ClaimManualBackup(r.Context(), time.Now())
+	if err != nil {
+		log.Printf("ASNS backup request status update failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "unable to start backup")
+		return
+	}
+	if !claimed {
+		writeError(w, http.StatusConflict, "a backup is already running")
+		return
+	}
+	h.recordAudit(r, &identity.ID, "backups.started")
+	go h.executeBackup()
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (h *Handler) executeBackup() {
+	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+	defer cancel()
+	settings, err := h.store.BackupSettings(ctx)
+	if err == nil {
+		_, err = h.backups.Create(ctx, settings.Destination)
+	}
+	status := "succeeded"
+	message := ""
+	if err != nil {
+		status = "failed"
+		message = err.Error()
+		log.Printf("ASNS backup failed: %v", err)
+	}
+	if saveErr := h.store.CompleteBackup(context.Background(), status, message); saveErr != nil {
+		log.Printf("ASNS backup status persistence failed: %v", saveErr)
+	}
+}
+
+func (h *Handler) stageBackupRestore(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request struct {
+		Name string `json:"name"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	stage, err := h.backups.StageRestore(request.Name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "backups.restore_staged")
+	writeJSON(w, http.StatusOK, stage)
+}
+
+func (h *Handler) applyBackupRestore(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request struct {
+		ID           string `json:"id"`
+		Confirmation string `json:"confirmation"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if request.Confirmation != "RESTORE" {
+		writeError(w, http.StatusBadRequest, "type RESTORE to confirm applying this backup")
+		return
+	}
+	if err := h.backups.ApplyStage(request.ID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured; restore cannot safely restart the service")
+		return
+	}
+	job, err := h.shareAgent.ApplyRestore(r.Context(), request.ID)
+	if err != nil {
+		log.Printf("ASNS restore request failed: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent could not start the restore")
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "backups.restore_started")
+	writeJSON(w, http.StatusAccepted, job)
+}
+
+func (h *Handler) backupRestoreStatus(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	job, err := h.shareAgent.RestoreStatus(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "restore job is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (h *Handler) listShares(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	shares, err := h.shareAgent.Shares(r.Context())
+	if err != nil {
+		log.Printf("ASNS SMB share listing failed: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "Samba management is unavailable")
+		return
+	}
+	users, err := h.shareAgent.SMBUsers(r.Context())
+	if err != nil {
+		log.Printf("ASNS SMB account listing failed: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "Samba account management is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"shares": shares, "users": users})
+}
+
+func (h *Handler) createShare(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	var request struct {
+		Name        string             `json:"name"`
+		Permissions []agent.Permission `json:"permissions"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	share, err := h.shareAgent.CreateShare(r.Context(), request.Name, request.Permissions)
+	if err != nil {
+		log.Printf("ASNS SMB share creation failed: %v", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "sharing.share_created")
+	writeJSON(w, http.StatusCreated, share)
+}
+
+func (h *Handler) updateShare(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	var request struct {
+		Name        string             `json:"name"`
+		Permissions []agent.Permission `json:"permissions"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	share, err := h.shareAgent.UpdateShare(r.Context(), r.PathValue("id"), request.Name, request.Permissions)
+	if err != nil {
+		log.Printf("ASNS SMB share update failed: %v", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "sharing.share_updated")
+	writeJSON(w, http.StatusOK, share)
+}
+
+func (h *Handler) deleteShare(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	if err := h.shareAgent.DeleteShare(r.Context(), r.PathValue("id")); err != nil {
+		log.Printf("ASNS SMB share removal failed: %v", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "sharing.share_removed")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) createSMBUser(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	user, err := h.shareAgent.CreateSMBUser(r.Context(), request.Username, request.Password)
+	if err != nil {
+		log.Printf("ASNS SMB account creation failed: %v", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "sharing.smb_user_created")
+	writeJSON(w, http.StatusCreated, user)
+}
+
+func (h *Handler) updateSMBPassword(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.shareAgent.UpdateSMBPassword(r.Context(), r.PathValue("username"), request.Password); err != nil {
+		log.Printf("ASNS SMB password update failed: %v", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "sharing.smb_password_updated")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) deleteSMBUser(w http.ResponseWriter, r *http.Request) {
+	if h.shareAgent == nil {
+		writeError(w, http.StatusServiceUnavailable, "ASNS Agent is not configured")
+		return
+	}
+	if err := h.shareAgent.DeleteSMBUser(r.Context(), r.PathValue("username")); err != nil {
+		log.Printf("ASNS SMB account removal failed: %v", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "sharing.smb_user_removed")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) requireAdmin(next http.Handler) http.Handler {

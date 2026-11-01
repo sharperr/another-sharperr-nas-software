@@ -1,0 +1,34 @@
+[Unit]
+Description=ASNS Restricted Privileged Agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=asns
+RuntimeDirectory=asns-agent
+RuntimeDirectoryMode=0750
+Environment=ASNS_AGENT_SOCKET=/run/asns-agent/asns-agent.sock
+Environment=ASNS_AGENT_STATE=/var/lib/asns-agent/state.json
+Environment=ASNS_SHARE_ROOT=/srv/asns/shares
+Environment=ASNS_DB_PATH=/var/lib/asns/asns.db
+Environment=ASNS_DATA_DIR=/var/lib/asns
+Environment=ASNS_USER_STORAGE_DIR=/var/lib/asns/users
+Environment=ASNS_BACKUP_DIR=/var/lib/asns/backups
+ExecStart=/opt/asns/asns-agent
+Restart=on-failure
+RestartSec=3
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc /var/lib/samba /var/lib/asns-agent /var/lib/asns /srv/asns/shares /run/asns-agent /run/lock
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { api } from "./services/api";
-import type { Disk, Identity, ManagedUser, StorageEntry, StorageListing, SystemSnapshot } from "./types/system";
+import type { BackupArchive, BackupSettings, Disk, DiskHealth, Identity, ManagedUser, MetricSample, RAIDArray, RestoreJob, RestoreStage, SMBPermission, SMBShare, SMBUser, StorageEntry, StorageListing, SystemSnapshot } from "./types/system";
 
 type Page =
   | "Overview"
@@ -251,6 +251,536 @@ function UserManagementPage({ identity }: { identity: Identity }) {
   );
 }
 
+function MetricChart({ title, unit, samples, value }: {
+  title: string;
+  unit: string;
+  samples: MetricSample[];
+  value: (sample: MetricSample) => number | null;
+}) {
+  const allValues = samples.map(value).filter((item): item is number => item !== null && Number.isFinite(item));
+  const maximum = Math.max(1, ...allValues);
+  const stride = Math.max(1, Math.ceil(samples.length / 180));
+  const points = samples.filter((_, index) => index % stride === 0 || index === samples.length - 1)
+    .map((sample, index, list) => {
+      const current = value(sample);
+      if (current === null || !Number.isFinite(current)) return null;
+      const x = list.length < 2 ? 0 : index * 100 / (list.length - 1);
+      const y = 96 - Math.min(1, current / maximum) * 88;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    }).filter((point): point is string => point !== null).join(" ");
+  return (
+    <section className="panel history-chart">
+      <div className="panel-heading"><div><h2>{title}</h2><p>{allValues.length} real samples · {unit}</p></div></div>
+      {allValues.length < 2
+        ? <div className="chart-empty">History will appear after ASNS collects more samples.</div>
+        : <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label={`${title} history chart`}>
+          <line x1="0" y1="8" x2="100" y2="8" />
+          <line x1="0" y1="52" x2="100" y2="52" />
+          <line x1="0" y1="96" x2="100" y2="96" />
+          <polyline points={points} />
+        </svg>}
+      {allValues.length > 0 && <div className="history-range"><span>Oldest: {new Date(samples[0].collectedAt).toLocaleString()}</span>
+        <strong>Peak: {Math.max(...allValues).toFixed(1)} {unit}</strong>
+        <span>Latest: {new Date(samples[samples.length - 1].collectedAt).toLocaleString()}</span></div>}
+    </section>
+  );
+}
+
+function MonitoringPage() {
+  const [hours, setHours] = useState(24);
+  const [samples, setSamples] = useState<MetricSample[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setError("");
+    try {
+      setSamples((await api.monitoringHistory(hours)).samples);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to load monitoring history");
+    } finally {
+      setLoading(false);
+    }
+  }, [hours]);
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const memoryPercent = (sample: MetricSample) =>
+    sample.memoryTotalBytes > 0 ? sample.memoryUsedBytes * 100 / sample.memoryTotalBytes : null;
+
+  return (
+    <div className="management-stack">
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      <section className="panel monitoring-toolbar">
+        <div><h2><Activity size={16} /> Host history</h2>
+          <p>Samples are read from Linux and retained locally for seven days.</p></div>
+        <div className="monitoring-controls">
+          <label htmlFor="history-hours">Time range</label>
+          <select id="history-hours" value={hours} onChange={(event) => setHours(Number(event.target.value))}>
+            <option value={1}>1 hour</option><option value={6}>6 hours</option>
+            <option value={24}>24 hours</option><option value={168}>7 days</option>
+          </select>
+          <Button variant="outline" className="outline-button" disabled={loading} onClick={() => void refresh()}>
+            <RefreshCw size={14} /> Refresh
+          </Button>
+        </div>
+      </section>
+      {loading && samples.length === 0
+        ? <div className="management-empty">Loading host history…</div>
+        : <>
+          <MetricChart title="Processor utilization" unit="%" samples={samples} value={(sample) => sample.cpuPercent} />
+          <MetricChart title="Memory utilization" unit="%" samples={samples} value={memoryPercent} />
+          <MetricChart title="Network receive rate" unit="B/s" samples={samples} value={(sample) => sample.receiveBytesPerSecond} />
+          <MetricChart title="Network send rate" unit="B/s" samples={samples} value={(sample) => sample.sendBytesPerSecond} />
+          <p className="quota-footnote">Monitoring samples are recorded every 10 seconds. SMART health and temperatures are unavailable until the ASNS Agent is installed.</p>
+        </>}
+    </div>
+  );
+}
+
+function SharingPage({ identity }: { identity: Identity }) {
+  const [shares, setShares] = useState<SMBShare[]>([]);
+  const [users, setUsers] = useState<SMBUser[]>([]);
+  const [permissions, setPermissions] = useState<Record<string, SMBPermission[]>>({});
+  const [newUsername, setNewUsername] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [shareName, setShareName] = useState("");
+  const [shareUsername, setShareUsername] = useState("");
+  const [shareAccess, setShareAccess] = useState<"read" | "write">("read");
+  const [passwordEdits, setPasswordEdits] = useState<Record<string, string>>({});
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setError("");
+    try {
+      const result = await api.shares();
+      setShares(result.shares);
+      setUsers(result.users);
+      setPermissions((current) => Object.fromEntries(result.shares.map((share) => [
+        share.id, current[share.id] ?? share.permissions,
+      ])));
+      if (!shareUsername && result.users.length > 0) setShareUsername(result.users[0].username);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to load SMB configuration");
+    } finally {
+      setLoading(false);
+    }
+  }, [shareUsername]);
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  async function createUser(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api.createSMBUser(newUsername, newPassword, identity.csrfToken);
+      setNewUsername("");
+      setNewPassword("");
+      setNotice("SMB account created. Its password is separate from ASNS sign-in.");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to create SMB account");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createShare(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!shareUsername) {
+      setError("Create an SMB account before creating a share.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api.createShare(shareName, [{ username: shareUsername, access: shareAccess }], identity.csrfToken);
+      setShareName("");
+      setNotice("SMB share created and Samba configuration reloaded.");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to create SMB share");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function updatePermission(share: SMBShare, username: string, access: "read" | "write") {
+    setPermissions((current) => {
+      const values = current[share.id] ?? share.permissions;
+      return { ...current, [share.id]: values.map((entry) => entry.username === username ? { ...entry, access } : entry) };
+    });
+  }
+
+  async function savePermissions(share: SMBShare) {
+    setBusy(true);
+    setError("");
+    try {
+      await api.updateShare(share.id, share.name, permissions[share.id] ?? share.permissions, identity.csrfToken);
+      setNotice(`Permissions saved for ${share.name}.`);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to update share permissions");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePermission(share: SMBShare, username: string) {
+    const updated = (permissions[share.id] ?? share.permissions).filter((entry) => entry.username !== username);
+    setPermissions((current) => ({ ...current, [share.id]: updated }));
+  }
+
+  async function removeShare(share: SMBShare) {
+    if (!window.confirm(`Remove the SMB share "${share.name}"? Its files will remain in ${share.path}.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.deleteShare(share.id, identity.csrfToken);
+      setNotice(`Share ${share.name} removed; stored files were preserved.`);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to remove share");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updatePassword(user: SMBUser) {
+    const password = passwordEdits[user.username] ?? "";
+    setBusy(true);
+    setError("");
+    try {
+      await api.updateSMBPassword(user.username, password, identity.csrfToken);
+      setPasswordEdits((values) => ({ ...values, [user.username]: "" }));
+      setNotice(`Password updated for ${user.username}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to update SMB password");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeUser(user: SMBUser) {
+    if (!window.confirm(`Delete SMB account ${user.username}? It must first be removed from all shares.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.deleteSMBUser(user.username, identity.csrfToken);
+      setNotice(`SMB account ${user.username} deleted.`);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to delete SMB account");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="management-stack">
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      {notice && <div className="status-banner"><div className="status-symbol"><Check size={17} /></div>
+        <div className="status-message"><strong>{notice}</strong></div></div>}
+      {loading ? <div className="management-empty">Connecting to the restricted ASNS Agent…</div> : <>
+        <section className="panel smb-accounts-panel">
+          <div className="panel-heading"><div><h2><UserPlus size={16} /> SMB accounts</h2>
+            <p>These credentials are separate from ASNS web accounts.</p></div></div>
+          <form className="smb-user-create-form" onSubmit={(event) => void createUser(event)}>
+            <label>SMB username<input value={newUsername} onChange={(event) => setNewUsername(event.target.value)}
+              pattern="asns_[a-z0-9][a-z0-9_-]{0,26}" maxLength={32} placeholder="asns_media" required /></label>
+            <label>Password<input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)}
+              minLength={12} maxLength={72} autoComplete="new-password" required /></label>
+            <Button className="primary-button" disabled={busy || !identity.role}>Create SMB account</Button>
+          </form>
+          {users.length === 0 ? <div className="management-empty">No SMB accounts exist yet.</div> :
+            <div className="smb-user-list">{users.map((user) => (
+              <article className="smb-user-row" key={user.username}>
+                <div><strong>{user.username}</strong><small>Created {new Date(user.createdAt).toLocaleDateString()}</small></div>
+                <input type="password" minLength={12} maxLength={72} placeholder="New password"
+                  aria-label={`New password for ${user.username}`} value={passwordEdits[user.username] ?? ""}
+                  onChange={(event) => setPasswordEdits((values) => ({ ...values, [user.username]: event.target.value }))} />
+                <Button variant="outline" className="outline-button" disabled={busy || (passwordEdits[user.username] ?? "").length < 12}
+                  onClick={() => void updatePassword(user)}>Update password</Button>
+                <Button variant="outline" className="outline-button danger-outline" disabled={busy} onClick={() => void removeUser(user)}>Delete</Button>
+              </article>
+            ))}</div>}
+        </section>
+        <section className="panel smb-shares-panel">
+          <div className="panel-heading"><div><h2><Network size={16} /> Network shares</h2>
+            <p>Shares expose only ASNS-created folders under <code>/srv/asns/shares</code>.</p></div></div>
+          <form className="smb-share-create-form" onSubmit={(event) => void createShare(event)}>
+            <label>Share name<input value={shareName} onChange={(event) => setShareName(event.target.value)}
+              pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" maxLength={64} required /></label>
+            <label>Account<select value={shareUsername} onChange={(event) => setShareUsername(event.target.value)} required>
+              {users.map((user) => <option value={user.username} key={user.username}>{user.username}</option>)}
+            </select></label>
+            <label>Access<select value={shareAccess} onChange={(event) => setShareAccess(event.target.value as "read" | "write")}>
+              <option value="read">Read only</option><option value="write">Read and write</option>
+            </select></label>
+            <Button className="primary-button" disabled={busy || users.length === 0}>Create share</Button>
+          </form>
+          {shares.length === 0 ? <div className="management-empty">No SMB shares are configured.</div> :
+            <div className="smb-share-list">{shares.map((share) => (
+              <article className="smb-share-card" key={share.id}>
+                <div className="smb-share-heading"><div><strong>{share.name}</strong>
+                  <small>Network path: \\&lt;NAS-address&gt;\{share.name} · Data path: {share.path}</small></div>
+                  <Button variant="outline" className="outline-button danger-outline" disabled={busy} onClick={() => void removeShare(share)}>Remove share</Button>
+                </div>
+                <div className="smb-permissions">
+                  {(permissions[share.id] ?? share.permissions).map((permission) => (
+                    <div className="smb-permission-row" key={permission.username}>
+                      <strong>{permission.username}</strong>
+                      <select value={permission.access} onChange={(event) => updatePermission(share, permission.username, event.target.value as "read" | "write")}>
+                        <option value="read">Read only</option><option value="write">Read and write</option>
+                      </select>
+                      <Button variant="outline" className="outline-button danger-outline" disabled={busy}
+                        onClick={() => void removePermission(share, permission.username)}>Remove access</Button>
+                    </div>
+                  ))}
+                  {users.some((user) => !(permissions[share.id] ?? share.permissions).some((permission) => permission.username === user.username)) && (
+                    <AddSharePermission share={share} users={users} permissions={permissions[share.id] ?? share.permissions}
+                      disabled={busy} onAdd={(username, access) => setPermissions((current) => ({
+                        ...current, [share.id]: [...(current[share.id] ?? share.permissions), { username, access }],
+                      }))} />
+                  )}
+                  <Button variant="outline" className="outline-button" disabled={busy} onClick={() => void savePermissions(share)}>Save permissions</Button>
+                </div>
+              </article>
+            ))}</div>}
+          <p className="quota-footnote">Removing a share removes its Samba definition but preserves the files. Network firewall and router exposure remain under your control.</p>
+        </section>
+      </>}
+    </div>
+  );
+}
+
+function AddSharePermission({ share, users, permissions, disabled, onAdd }: {
+  share: SMBShare;
+  users: SMBUser[];
+  permissions: SMBPermission[];
+  disabled: boolean;
+  onAdd: (username: string, access: "read" | "write") => void;
+}) {
+  const [username, setUsername] = useState(users.find((user) => !permissions.some((permission) => permission.username === user.username))?.username ?? "");
+  const [access, setAccess] = useState<"read" | "write">("read");
+  const available = users.filter((user) => !permissions.some((permission) => permission.username === user.username));
+  if (available.length === 0) return null;
+  return <form className="smb-add-permission" onSubmit={(event) => {
+    event.preventDefault();
+    if (username) onAdd(username, access);
+  }}>
+    <select value={username} onChange={(event) => setUsername(event.target.value)}>
+      {available.map((user) => <option key={user.username} value={user.username}>{user.username}</option>)}
+    </select>
+    <select value={access} onChange={(event) => setAccess(event.target.value as "read" | "write")}>
+      <option value="read">Read only</option><option value="write">Read and write</option>
+    </select>
+    <Button variant="outline" className="outline-button" disabled={disabled}>Add access</Button>
+    <span className="sr-only">Add SMB account permissions for {share.name}</span>
+  </form>;
+}
+
+function BackupsPage({ identity }: { identity: Identity }) {
+  const [settings, setSettings] = useState<BackupSettings>({
+    enabled: false, intervalHours: 24, destination: "", lastStatus: "",
+  });
+  const [archives, setArchives] = useState<BackupArchive[]>([]);
+  const [stage, setStage] = useState<RestoreStage | null>(null);
+  const [restoreJob, setRestoreJob] = useState<RestoreJob | null>(null);
+  const [confirmation, setConfirmation] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setError("");
+    try {
+      const result = await api.backups();
+      setSettings(result.settings);
+      setArchives(result.archives);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to load backups");
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+  useEffect(() => {
+    if (!restoreJob || ["succeeded", "failed"].includes(restoreJob.status)) return;
+    let active = true;
+    let timer: number;
+    const poll = async () => {
+      try {
+        const job = await api.backupRestoreStatus(restoreJob.id);
+        if (!active) return;
+        setRestoreJob(job);
+        if (job.status === "succeeded") setNotice("Restore completed; ASNS has restarted.");
+        if (job.status === "failed") setError(job.error || "Restore failed");
+      } catch {
+        if (active) setNotice("Waiting for ASNS to restart after applying the restore…");
+      }
+      if (active) timer = window.setTimeout(poll, 2000);
+    };
+    timer = window.setTimeout(poll, 1000);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [restoreJob]);
+
+  async function saveSettings(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      setSettings(await api.setBackupSettings(settings, identity.csrfToken));
+      setNotice("Backup schedule saved.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to save backup settings");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runBackup() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api.runBackup(identity.csrfToken);
+      setNotice("Backup started. Its status will update here.");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to start backup");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stageRestore(archive: BackupArchive) {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    setRestoreJob(null);
+    try {
+      setStage(await api.stageBackupRestore(archive.name, identity.csrfToken));
+      setConfirmation("");
+      setNotice("Archive integrity and SQLite checks passed; restore is staged.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Backup verification failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyRestore() {
+    if (!stage || confirmation !== "RESTORE") return;
+    setBusy(true);
+    setError("");
+    try {
+      const job = await api.applyBackupRestore(stage.id, confirmation, identity.csrfToken);
+      setRestoreJob(job);
+      setNotice("Restore queued. ASNS will briefly restart while the verified snapshot is applied.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to apply restore");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteArchive(archive: BackupArchive) {
+    if (!window.confirm(`Permanently delete backup ${archive.name}? This cannot be undone.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.deleteBackup(archive.name, identity.csrfToken);
+      if (stage) setStage(null);
+      setRestoreJob(null);
+      setNotice(`Backup ${archive.name} deleted.`);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to delete backup");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="management-stack">
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      {notice && <div className="status-banner"><div className="status-symbol"><Check size={17} /></div>
+        <div className="status-message"><strong>{notice}</strong></div></div>}
+      <section className="panel backup-settings-panel">
+        <div className="panel-heading"><div><h2><Database size={16} /> Backup schedule</h2>
+          <p>Archives include a consistent SQLite snapshot and ASNS-managed user files.</p></div></div>
+        <form className="backup-settings-form" onSubmit={(event) => void saveSettings(event)}>
+          <label className="backup-enabled"><input type="checkbox" checked={settings.enabled}
+            onChange={(event) => setSettings({ ...settings, enabled: event.target.checked })} /> Enable scheduled backups</label>
+          <label>Repeat every
+            <input type="number" min="1" max="720" value={settings.intervalHours}
+              onChange={(event) => setSettings({ ...settings, intervalHours: Number(event.target.value) })} required />
+            <span>hours</span>
+          </label>
+          <label>Destination folder
+            <input value={settings.destination} onChange={(event) => setSettings({ ...settings, destination: event.target.value })}
+              placeholder="(ASNS backup root)" />
+          </label>
+          <div className="backup-settings-actions">
+            <Button className="primary-button" disabled={busy}>Save schedule</Button>
+            <Button type="button" variant="outline" className="outline-button" disabled={busy} onClick={() => void runBackup()}>
+              <Database size={14} /> Run backup now
+            </Button>
+          </div>
+          <small>Destination is a folder relative to the ASNS backup root. Mount external storage at <code>/var/lib/asns/backups</code> and ensure the ASNS service account can write to it. Archives are kept until an administrator deletes them.</small>
+        </form>
+        <div className="backup-status">
+          <Detail label="Last run" value={settings.lastRunAt ? new Date(settings.lastRunAt).toLocaleString() : "Never"} />
+          <Detail label="Status" value={settings.lastStatus || "Not run"} />
+          <Detail label="Next run" value={settings.enabled && settings.nextRunAt ? new Date(settings.nextRunAt).toLocaleString() : "Schedule disabled"} />
+        </div>
+        {settings.lastError && <p className="error-text">{settings.lastError}</p>}
+      </section>
+      <section className="panel backup-history-panel">
+        <div className="panel-heading"><div><h2>Backup history</h2><p>{archives.length} archives · integrity checked before restore</p></div>
+          <Button variant="outline" className="outline-button" onClick={() => void refresh()}><RefreshCw size={14} /> Refresh</Button></div>
+        {archives.length === 0 ? <div className="management-empty">No backups yet. Run one now or enable a schedule.</div> :
+          <div className="backup-list">{archives.map((archive) => (
+            <article className="backup-row" key={archive.name}>
+              <div><strong>{archive.name}</strong><small>{new Date(archive.createdAt).toLocaleString()} · {formatBytes(archive.sizeBytes)}</small></div>
+              <div className="backup-row-actions">
+                <Button variant="outline" className="outline-button" disabled={busy} onClick={() => void stageRestore(archive)}>
+                  <ShieldCheck size={14} /> Verify restore
+                </Button>
+                <Button variant="outline" className="outline-button danger-outline" disabled={busy} onClick={() => void deleteArchive(archive)}>
+                  <Trash2 size={14} /> Delete
+                </Button>
+              </div>
+            </article>
+          ))}</div>}
+      </section>
+      {stage && <section className="panel restore-stage-panel">
+        <div className="panel-heading"><div><h2>Verified restore staged</h2>
+          <p>Snapshot time: {new Date(stage.createdAt).toLocaleString()} · {stage.fileCount} files · {formatBytes(stage.totalSizeBytes)}</p></div>
+          <Button variant="outline" className="outline-button" onClick={() => { setStage(null); setRestoreJob(null); }}>Cancel</Button></div>
+        <p>This will replace the active ASNS database and managed files. The service must restart to apply it. Type <strong>RESTORE</strong> to confirm.</p>
+        {restoreJob && <p className={restoreJob.status === "failed" ? "error-text" : "restore-job-state"}>
+          Restore status: {restoreJob.status}{restoreJob.error ? ` — ${restoreJob.error}` : ""}
+        </p>}
+        <div className="restore-confirm">
+          <input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} aria-label="Type RESTORE to confirm" />
+          <Button className="danger-button" disabled={busy || confirmation !== "RESTORE" || Boolean(restoreJob)} onClick={() => void applyRestore()}>
+            Apply restore
+          </Button>
+        </div>
+      </section>}
+    </div>
+  );
+}
+
 function FileManagerPage({ identity }: { identity: Identity }) {
   const [directory, setDirectory] = useState("");
   const [listing, setListing] = useState<StorageListing | null>(null);
@@ -400,6 +930,10 @@ function App() {
   const [authError, setAuthError] = useState("");
   const [snapshot, setSnapshot] = useState<SystemSnapshot | null>(null);
   const [disks, setDisks] = useState<Disk[]>([]);
+  const [diskHealth, setDiskHealth] = useState<DiskHealth[]>([]);
+  const [smartError, setSmartError] = useState("");
+  const [raidArrays, setRaidArrays] = useState<RAIDArray[]>([]);
+  const [raidError, setRaidError] = useState("");
   const [systemError, setSystemError] = useState("");
   const [page, setPage] = useState<Page>("Overview");
   const [simpleMode, setSimpleMode] = useState(() => storedBoolean("asns.simple-mode", true));
@@ -438,7 +972,9 @@ function App() {
     refreshInFlight.current = true;
     setRefreshing(true);
     try {
-      const [systemResult, diskResult] = await Promise.allSettled([api.system(), api.disks()]);
+      const [systemResult, diskResult, smartResult, raidResult] = await Promise.allSettled([
+        api.system(), api.disks(), api.diskHealth(), api.raidArrays(),
+      ]);
       const errors: string[] = [];
 
       if (systemResult.status === "fulfilled") {
@@ -464,6 +1000,18 @@ function App() {
         if (diskResult.reason instanceof Error && diskResult.reason.message === "authentication required") {
           setIdentity(null);
         }
+      }
+      if (smartResult.status === "fulfilled") {
+        setDiskHealth(smartResult.value.disks);
+        setSmartError("");
+      } else {
+        setSmartError(smartResult.reason instanceof Error ? smartResult.reason.message : "SMART information is unavailable");
+      }
+      if (raidResult.status === "fulfilled") {
+        setRaidArrays(raidResult.value.arrays);
+        setRaidError("");
+      } else {
+        setRaidError(raidResult.reason instanceof Error ? raidResult.reason.message : "RAID status is unavailable");
       }
       setSystemError(errors.join("; "));
     } finally {
@@ -515,8 +1063,10 @@ function App() {
   );
   const filteredPages = useMemo(() => {
     const term = search.trim().toLowerCase();
-    const availablePages = managementPages.filter((item) => item.label !== "Users" || identity?.role === "admin");
-    return [...workspacePages, ...availablePages].filter((item) =>
+    const availableWorkspacePages = workspacePages.filter((item) => item.label !== "Sharing" || identity?.role === "admin");
+    const availableManagementPages = managementPages.filter((item) =>
+      !["Users", "Backups"].includes(item.label) || identity?.role === "admin");
+    return [...availableWorkspacePages, ...availableManagementPages].filter((item) =>
       item.label.toLowerCase().includes(term),
     );
   }, [identity?.role, search]);
@@ -588,14 +1138,14 @@ function App() {
 
         <div className="nav-caption">WORKSPACE</div>
         <nav aria-label="Workspace">
-          {workspacePages.map(({ label, icon: Icon }) => (
+          {workspacePages.filter((item) => item.label !== "Sharing" || identity.role === "admin").map(({ label, icon: Icon }) => (
             <NavButton key={label} label={label} icon={<Icon size={17} />} active={page === label}
               onClick={() => navigate(label)} />
           ))}
         </nav>
         <div className="nav-caption manage-caption">MANAGE</div>
         <nav aria-label="Management">
-          {managementPages.filter((item) => item.label !== "Users" || identity.role === "admin").map(({ label, icon: Icon }) => (
+          {managementPages.filter((item) => !["Users", "Backups"].includes(item.label) || identity.role === "admin").map(({ label, icon: Icon }) => (
             <NavButton key={label} label={label} icon={<Icon size={17} />} active={page === label}
               onClick={() => navigate(label)} />
           ))}
@@ -709,6 +1259,8 @@ function App() {
                 ? "A clear picture of what's happening on your NAS."
                 : page === "Storage"
                   ? "Physical block devices discovered on this Linux host."
+                  : page === "Monitoring"
+                    ? "Live system telemetry and seven days of persisted host history."
                   : page === "Users"
                     ? "Create accounts and manage storage limits."
                     : page === "File manager"
@@ -732,11 +1284,15 @@ function App() {
           )}
 
           {page === "Storage" && (
-            <StoragePage disks={disks} error={systemError} onRefresh={() => void refresh()} />
+            <StoragePage disks={disks} health={diskHealth} smartError={smartError} raidArrays={raidArrays}
+              raidError={raidError} error={systemError} onRefresh={() => void refresh()} />
           )}
           {page === "Users" && identity.role === "admin" && <UserManagementPage identity={identity} />}
           {page === "File manager" && <FileManagerPage identity={identity} />}
-          {page !== "Overview" && page !== "Storage" && page !== "Users" && page !== "File manager" &&
+          {page === "Monitoring" && <MonitoringPage />}
+          {page === "Sharing" && identity.role === "admin" && <SharingPage identity={identity} />}
+          {page === "Backups" && identity.role === "admin" && <BackupsPage identity={identity} />}
+          {page !== "Overview" && page !== "Storage" && page !== "Users" && page !== "File manager" && page !== "Monitoring" &&
             <ComingSoonPage page={page} />}
 
           {page === "Overview" && (
@@ -964,9 +1520,21 @@ function PerformanceChart({ cpu, memory }: { cpu: number[]; memory: number[] }) 
   );
 }
 
-function StoragePage({ disks, error, onRefresh }: { disks: Disk[]; error: string; onRefresh: () => void }) {
+function StoragePage({ disks, health, smartError, raidArrays, raidError, error, onRefresh }: {
+  disks: Disk[];
+  health: DiskHealth[];
+  smartError: string;
+  raidArrays: RAIDArray[];
+  raidError: string;
+  error: string;
+  onRefresh: () => void;
+}) {
   const capacity = disks.reduce((total, disk) => total + disk.capacityBytes, 0);
+  const critical = health.some((disk) => disk.healthy === false);
+  const checked = health.length > 0 && health.every((disk) => disk.healthy !== undefined);
+  const overallHealth = critical ? "Critical" : checked ? "Healthy" : smartError ? "Unavailable" : "Unknown";
   return (
+    <>
     <section className="panel full-storage-panel">
       <div className="panel-heading">
         <div><h2>Physical disks</h2>
@@ -977,19 +1545,26 @@ function StoragePage({ disks, error, onRefresh }: { disks: Disk[]; error: string
       <div className="storage-summary">
         <div><span>DEVICES</span><strong>{disks.length}</strong></div>
         <div><span>RAW CAPACITY</span><strong>{disks.length ? formatBytes(capacity) : "—"}</strong></div>
-        <div><span>HEALTH</span><strong className="unknown-health">Not checked</strong></div>
+        <div><span>HEALTH</span><strong className={critical ? "critical-health" : checked ? "healthy-health" : "unknown-health"}>{overallHealth}</strong></div>
       </div>
       {disks.length ? (
         <div className="full-disk-list">
-          {disks.map((disk) => (
-            <article className="full-disk-row" key={disk.name}>
-              <div className="disk-icon"><HardDrive size={17} /></div>
-              <div className="full-disk-info"><strong>{disk.model || disk.name}</strong>
-                <span>{disk.name} · {disk.serial ? `Serial ${disk.serial}` : "Serial not exposed"} · {disk.removable ? "Removable device" : "Fixed device"}</span>
-              </div>
-              <span className="disk-capacity"><b>{formatBytes(disk.capacityBytes)}</b><small>raw capacity</small></span>
-            </article>
-          ))}
+          {disks.map((disk) => {
+            const smart = health.find((item) => item.device === disk.name);
+            return (
+              <article className="full-disk-row" key={disk.name}>
+                <div className="disk-icon"><HardDrive size={17} /></div>
+                <div className="full-disk-info"><strong>{disk.model || disk.name}</strong>
+                  <span>{disk.name} · {disk.serial ? `Serial ${disk.serial}` : "Serial not exposed"} · {disk.removable ? "Removable device" : "Fixed device"}</span>
+                  <small className={smart?.healthy === false ? "critical-health" : smart?.healthy === true ? "healthy-health" : "unknown-health"}>
+                    SMART {smart?.healthy === undefined ? (smart?.error || smartError || "Not reported") : smart.healthy ? "Healthy" : "Critical"}
+                    {smart?.temperatureC !== undefined ? ` · ${smart.temperatureC}°C` : ""}
+                  </small>
+                </div>
+                <span className="disk-capacity"><b>{formatBytes(disk.capacityBytes)}</b><small>raw capacity</small></span>
+              </article>
+            );
+          })}
         </div>
       ) : (
         <div className="empty-state"><HardDrive size={22} />
@@ -999,9 +1574,44 @@ function StoragePage({ disks, error, onRefresh }: { disks: Disk[]; error: string
       )}
       <div className="storage-disclaimer">
         <ShieldCheck size={15} />
-        SMART health, temperature, filesystem use, and mount management are not available yet.
+        {smartError ? `SMART data unavailable: ${smartError}` : "SMART status and temperature are reported only when supported by the device and smartmontools."}
       </div>
     </section>
+    <section className="panel full-storage-panel">
+      <div className="panel-heading"><div><h2>Software RAID arrays</h2>
+        <p>Read-only status from Linux md and mdadm. ASNS does not create, reshape, or alter arrays.</p></div>
+        <Button variant="outline" className="outline-button" onClick={onRefresh}><RefreshCw size={14} /> Refresh</Button>
+      </div>
+      {raidError ? <div className="empty-state"><HardDrive size={22} />
+        <span>RAID status is unavailable</span><small>{raidError}</small>
+      </div> : raidArrays.length ? (
+        <div className="full-disk-list">
+          {raidArrays.map((array) => {
+            const stateClass = array.state === "healthy" ? "healthy-health" :
+              array.state === "degraded" ? "critical-health" : "unknown-health";
+            return <article className="full-disk-row" key={array.name}>
+              <div className="disk-icon"><HardDrive size={17} /></div>
+              <div className="full-disk-info"><strong>/dev/{array.name} · {array.level}</strong>
+                <span>Members: {array.devices.length ? array.devices.join(", ") : "not reported"}</span>
+                <small className={stateClass}>
+                  {array.state} · {array.activeDevices}/{array.raidDevices} active
+                  {array.degraded > 0 ? ` · ${array.degraded} missing or failed` : ""}
+                  {array.mdadmState ? ` · mdadm: ${array.mdadmState}` : ""}
+                  {array.detailError ? ` · ${array.detailError}` : ""}
+                </small>
+              </div>
+              {array.syncAction && <span className="disk-capacity">
+                <b>{array.syncPercent === undefined ? array.syncAction : `${array.syncPercent.toFixed(1)}%`}</b>
+                <small>{array.syncAction}</small>
+              </span>}
+            </article>;
+          })}
+        </div>
+      ) : <div className="empty-state"><HardDrive size={22} />
+        <span>No mdadm RAID arrays were detected</span><small>Existing software RAID arrays appear here; this page does not create or modify arrays.</small>
+      </div>}
+    </section>
+    </>
   );
 }
 
@@ -1015,15 +1625,15 @@ function ComingSoonPage({ page }: { page: Page }) {
     Storage: "",
     "File manager": "Browse, upload, download, and organize files stored on your NAS.",
     Sharing: "Configure SMB shares and manage access permissions.",
-    Applications: "Inspect Docker applications and manage their lifecycle.",
-    Monitoring: "Review system history, SMART status, temperatures, and logs.",
+    Applications: "Docker application installation is intentionally not included in this implementation.",
+    Monitoring: "Review live CPU, memory, and network samples collected directly from Linux.",
     Users: "Manage local ASNS accounts, roles, and active sessions.",
     Backups: "Configure destinations, scheduled jobs, and restore points.",
   };
   return (
     <section className="coming-soon">
       <div className="coming-icon"><SlidersHorizontal size={22} /></div>
-      <span className="eyebrow">PLANNED FOR A FUTURE RELEASE</span>
+      <span className="eyebrow">{page === "Applications" ? "DEFERRED BY REQUEST" : "PLANNED FOR A FUTURE RELEASE"}</span>
       <h2>{page} is not implemented yet</h2>
       <p>{descriptions[page]}</p>
       <p className="coming-note">This section does not display mock data or issue system commands.</p>

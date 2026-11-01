@@ -1,6 +1,6 @@
 [Unit]
 Description=ASNS NAS Management Platform
-After=network.target
+After=network.target asns-agent.service
 
 [Service]
 Type=simple
