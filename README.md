@@ -10,9 +10,17 @@ On a Debian 13 system with network access, run this from a root shell (`root@asn
 set -o pipefail && curl -fsSL https://raw.githubusercontent.com/sharperr/another-sharperr-nas-software/main/deployment/scripts/install.sh | bash
 ```
 
-Do not use `sudo` when already logged in as root. If you are a non-root user and `sudo` is installed, use `... | sudo bash` instead. The installer installs Git and the build dependencies (Go, Node.js/npm, and OpenSSL), clones the repository's `main` branch into `/opt/asns/source` on first install, and runs `git pull --ff-only origin main` on subsequent installs. It then downloads Go modules, installs npm dependencies, builds the frontend and Go API/CLI, installs the frontend and API under `/opt/asns`, installs the `asns` CLI in `/usr/local/bin`, creates a dedicated unprivileged service account, and enables the systemd service. Updates stop rather than overwrite a source checkout with local modifications. Review the [installer script](https://github.com/sharperr/another-sharperr-nas-software/blob/main/deployment/scripts/install.sh) before running it as root. On a new install it generates a random initial administrator password and prints it before building; save it. After the first successful startup, the bootstrap password is removed from its configuration. Reinstalling preserves the existing configuration and database.
+Do not use `sudo` when already logged in as root. If you are a non-root user and `sudo` is installed, use `... | sudo bash` instead. The installer installs Git and the build dependencies (Go and Node.js/npm), clones the repository's `main` branch into `/opt/asns/source` on first install, and runs `git pull --ff-only origin main` on subsequent installs. It then downloads Go modules, installs npm dependencies, builds the frontend and Go API/CLI, installs the frontend and API under `/opt/asns`, installs the `asns` CLI in `/usr/local/bin`, creates a dedicated unprivileged service account, and enables the systemd service. Updates stop rather than overwrite a source checkout with local modifications. Review the [installer script](https://github.com/sharperr/another-sharperr-nas-software/blob/main/deployment/scripts/install.sh) before running it as root. On first install, the script securely prompts you to set and confirm an administrator password of 12-72 supported characters; it does not generate or print a password. For unattended installs, set `ASNS_ADMIN_PASSWORD` in the environment. The password is temporarily stored in the root-owned service configuration for first startup and removed after successful setup. Reinstalling preserves the existing configuration and database.
 
-The service listens on `127.0.0.1:8080`. Use a TLS-terminating reverse proxy for remote access; do not expose the HTTP service directly to an untrusted network.
+The service listens on `127.0.0.1:8080` on the NAS itself. To check it from the NAS, use `curl -i http://127.0.0.1:8080/` or `asns health`; `ping` does not test TCP ports, and `ping 127.0.0.1:8080` is not a valid ping target.
+
+To open the dashboard from your computer without exposing the HTTP service to the LAN, open a second terminal on your computer and create an SSH tunnel:
+
+```sh
+ssh -L 8080:127.0.0.1:8080 root@192.168.0.15
+```
+
+Keep that SSH session open, then visit <http://127.0.0.1:8080> in your computer's browser. If local port 8080 is already in use on your computer, use `ssh -L 8081:127.0.0.1:8080 root@192.168.0.15` and visit <http://127.0.0.1:8081>. For access without an SSH tunnel, configure a TLS-terminating reverse proxy; do not expose the HTTP service directly to an untrusted network.
 
 ### CLI
 
@@ -82,6 +90,9 @@ The service unit is [deployment/systemd/asns.service](./deployment/systemd/asns.
 - `POST /api/v1/auth/logout` — end session; requires `X-CSRF-Token`.
 - `GET /api/v1/system` — live CPU, memory, network rates, and uptime.
 - `GET /api/v1/disks` — physical block devices discovered through sysfs.
+- `GET/POST /api/v1/users` — administrator-only account listing and creation, including measured storage usage and quota.
+- `PUT /api/v1/users/{id}/quota` — administrator-only storage limit update; `0` means unlimited.
+- `/api/v1/files` — authenticated per-user file listing, upload, download, folder creation, and deletion. Uploads are rejected if they exceed the account quota.
 
 All endpoints other than health and login require an authenticated session. Non-GET requests require the session CSRF token.
 
@@ -91,6 +102,8 @@ Passwords use bcrypt; only hashes of high-entropy session tokens are stored. Ses
 
 Dashboard metrics are read directly from Linux procfs/sysfs; unsupported host information is shown as unavailable, not replaced with sample values. The Advanced mode shows additional host details; Simple mode explains the displayed measurements. Theme and mode preferences are saved in the browser.
 
-Not implemented in this release: SMART health/temperatures, filesystem and mount management, file browsing, SMB, Docker management, persistent metric history, administrative user management, backups, privileged agent operations, and WebSockets. The corresponding dashboard sections are marked as planned and do not claim these features work. Monitoring refresh currently uses authenticated REST polling every three seconds.
+Per-user quotas apply to files stored in ASNS-managed account folders under `/var/lib/asns/users`; usage is measured from regular file sizes, and uploads through ASNS are blocked at the configured limit. This does not impose Linux filesystem quotas or include files outside ASNS-managed storage.
+
+Not implemented in this release: SMART health/temperatures, filesystem and mount management, SMB, Docker management, persistent metric history, account roles beyond administrator and standard user, backups, privileged agent operations, and WebSockets. Monitoring refresh currently uses authenticated REST polling every three seconds.
 
 This development workspace may be used on Windows, but the live monitor reads Linux procfs/sysfs and therefore requires a Linux host to display system metrics. No Windows demonstration values are generated.

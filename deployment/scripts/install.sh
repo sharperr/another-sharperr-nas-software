@@ -32,7 +32,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates git golang-go nodejs npm openssl
+apt-get install -y --no-install-recommends ca-certificates git golang-go nodejs npm
 
 command -v git >/dev/null 2>&1 || fail "Git installation failed"
 command -v go >/dev/null 2>&1 || fail "Go installation failed"
@@ -123,7 +123,6 @@ if [[ -f "${database_file}" ]]; then
   existing_database=1
 fi
 
-generated_password=""
 configured_username="$(get_setting ASNS_ADMIN_USERNAME)"
 configured_password="$(get_setting ASNS_ADMIN_PASSWORD)"
 if [[ -n "${ASNS_ADMIN_USERNAME:-}" && -z "${configured_username}" ]]; then
@@ -137,8 +136,16 @@ if [[ "${existing_database}" -eq 0 ]]; then
     configured_username="admin"
   fi
   if [[ -z "${configured_password}" ]]; then
-    generated_password="$(openssl rand -hex 24)"
-    configured_password="${generated_password}"
+    [[ -r /dev/tty ]] ||
+      fail "first install needs an interactive terminal to set the administrator password; rerun from a terminal or set ASNS_ADMIN_PASSWORD before starting the installer"
+    printf 'Create the initial ASNS administrator account.\n'
+    IFS= read -r -s -p "Set password for ${configured_username} (12-72 supported characters): " configured_password </dev/tty
+    printf '\n' >/dev/tty
+    IFS= read -r -s -p "Confirm administrator password: " password_confirmation </dev/tty
+    printf '\n' >/dev/tty
+    [[ "${configured_password}" == "${password_confirmation}" ]] ||
+      fail "administrator passwords do not match; rerun the installer"
+    unset password_confirmation
   fi
   [[ "${configured_username}" =~ ^[A-Za-z0-9._-]{1,64}$ ]] ||
     fail "administrator username must be 1-64 letters, numbers, dots, underscores, or hyphens"
@@ -151,10 +158,9 @@ else
 fi
 chmod 0640 "${CONFIG_FILE}"
 
-if [[ -n "${generated_password}" ]]; then
+if [[ "${existing_database}" -eq 0 ]]; then
   printf '\nInitial administrator username: %s\n' "${configured_username}"
-  printf 'Initial administrator password: %s\n' "${generated_password}"
-  printf 'Save this password now. The installer will remove it from its configuration after setup.\n\n'
+  printf 'The password you set is stored temporarily for first startup and removed after successful setup.\n\n'
 fi
 
 build_dir="$(mktemp -d)"
@@ -230,7 +236,10 @@ fi
 "${CLI_FILE}" health
 
 printf '\nASNS 0.1.0 is installed and enabled.\n'
-printf 'Dashboard: http://127.0.0.1:8080\n'
+printf 'Dashboard on the NAS: http://127.0.0.1:8080\n'
+printf 'From your computer, run: ssh -L 8080:127.0.0.1:8080 root@<nas-address>\n'
+printf 'Then open http://127.0.0.1:8080 in your computer browser; keep the SSH tunnel open.\n'
+printf 'Use curl -i http://127.0.0.1:8080/ on the NAS to test HTTP (ping does not test ports).\n'
 printf 'CLI:       asns help | asns health | asns launch\n'
 printf '\nUninstall without deleting NAS data: bash %s/deployment/scripts/uninstall.sh\n' "${SOURCE_DIR}"
 printf 'Uninstall and remove ASNS config/database: bash %s/deployment/scripts/uninstall.sh --purge\n' "${SOURCE_DIR}"

@@ -28,3 +28,27 @@ export interface Disk {
   capacityBytes: number;
   removable: boolean;
 }
+
+export interface ManagedUser {
+  id: number;
+  username: string;
+  role: "admin" | "user";
+  quotaBytes: number;
+  storageUsedBytes: number;
+  createdAt: string;
+}
+
+export interface StorageEntry {
+  name: string;
+  path: string;
+  directory: boolean;
+  sizeBytes: number;
+  modifiedAt: string;
+}
+
+export interface StorageListing {
+  entries: StorageEntry[];
+  directory: string;
+  usedBytes: number;
+  quotaBytes: number;
+}

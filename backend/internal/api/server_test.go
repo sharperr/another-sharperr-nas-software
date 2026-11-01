@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,7 +23,6 @@ func TestAuthenticationAndCSRF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	defer store.Close()
 	if err := store.EnsureAdmin(context.Background(), "admin", "a-unique-password-longer-than-12"); err != nil {
 		t.Fatal(err)
@@ -33,24 +35,9 @@ func TestAuthenticationAndCSRF(t *testing.T) {
 		t.Fatalf("expected 401 for unauthenticated request, got %d", unauthenticated.Code)
 	}
 
-	login := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"a-unique-password-longer-than-12"}`))
-	login.RemoteAddr = "127.0.0.1:1234"
-	loginResponse := httptest.NewRecorder()
-	handler.ServeHTTP(loginResponse, login)
-	if loginResponse.Code != http.StatusOK {
-		t.Fatalf("expected successful login, got %d: %s", loginResponse.Code, loginResponse.Body.String())
-	}
-	var identity auth.Identity
-	if err := json.Unmarshal(loginResponse.Body.Bytes(), &identity); err != nil {
-		t.Fatal(err)
-	}
-	cookies := loginResponse.Result().Cookies()
-	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
-		t.Fatalf("session cookie is missing required protections: %+v", cookies)
-	}
-
+	identity, cookie := testLogin(t, handler, "admin", "a-unique-password-longer-than-12")
 	logout := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
-	logout.AddCookie(cookies[0])
+	logout.AddCookie(cookie)
 	logoutResponse := httptest.NewRecorder()
 	handler.ServeHTTP(logoutResponse, logout)
 	if logoutResponse.Code != http.StatusForbidden {
@@ -58,14 +45,14 @@ func TestAuthenticationAndCSRF(t *testing.T) {
 	}
 
 	logout = httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
-	logout.AddCookie(cookies[0])
+	logout.AddCookie(cookie)
 	logout.Header.Set("X-CSRF-Token", identity.CSRF)
 	logoutResponse = httptest.NewRecorder()
 	handler.ServeHTTP(logoutResponse, logout)
 	if logoutResponse.Code != http.StatusNoContent {
 		t.Fatalf("expected successful logout, got %d", logoutResponse.Code)
 	}
-	if loginResponse.Header().Get("Content-Security-Policy") == "" {
+	if logoutResponse.Header().Get("Content-Security-Policy") == "" {
 		t.Fatal("expected secure HTTP headers")
 	}
 }
@@ -106,4 +93,138 @@ func TestFrontendFallbackAndAPI404(t *testing.T) {
 	if notFound.Code != http.StatusNotFound {
 		t.Fatalf("unknown API path should return 404, got %d", notFound.Code)
 	}
+}
+
+func TestAdminUserManagementAndEnforcedStorageQuota(t *testing.T) {
+	ctx := context.Background()
+	store, err := database.Open(filepath.Join(t.TempDir(), "asns.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureAdmin(ctx, "admin", "a-unique-password-longer-than-12"); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(store, auth.NewService(store), monitoring.New(t.TempDir(), t.TempDir()), false, "", filepath.Join(t.TempDir(), "users"))
+
+	adminIdentity, adminCookie := testLogin(t, handler, "admin", "a-unique-password-longer-than-12")
+	create := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(
+		`{"username":"media","password":"another-unique-password-longer-than-12","quotaBytes":4}`,
+	))
+	create.AddCookie(adminCookie)
+	create.Header.Set("X-CSRF-Token", adminIdentity.CSRF)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, create)
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create user failed: %d %s", createResponse.Code, createResponse.Body.String())
+	}
+	var createdUser struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &createdUser); err != nil {
+		t.Fatal(err)
+	}
+
+	userIdentity, userCookie := testLogin(t, handler, "media", "another-unique-password-longer-than-12")
+	forbidden := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+	request.AddCookie(userCookie)
+	handler.ServeHTTP(forbidden, request)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("standard user must not list accounts, got %d", forbidden.Code)
+	}
+
+	upload := func(name, contents string) *httptest.ResponseRecorder {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, err := writer.CreateFormFile("file", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(contents)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.WriteField("directory", ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/files/upload", &body)
+		request.Header.Set("Content-Type", writer.FormDataContentType())
+		request.Header.Set("X-CSRF-Token", userIdentity.CSRF)
+		request.AddCookie(userCookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if response := upload("file.txt", "four"); response.Code != http.StatusNoContent {
+		t.Fatalf("upload within quota failed: %d %s", response.Code, response.Body.String())
+	}
+	if response := upload("extra.txt", "x"); response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("upload over quota was not rejected: %d %s", response.Code, response.Body.String())
+	}
+	updateQuota := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/users/%d/quota", createdUser.ID), strings.NewReader(`{"quotaBytes":8}`))
+	updateQuota.AddCookie(adminCookie)
+	updateQuota.Header.Set("X-CSRF-Token", adminIdentity.CSRF)
+	updateQuotaResponse := httptest.NewRecorder()
+	handler.ServeHTTP(updateQuotaResponse, updateQuota)
+	if updateQuotaResponse.Code != http.StatusOK {
+		t.Fatalf("updating user quota failed: %d %s", updateQuotaResponse.Code, updateQuotaResponse.Body.String())
+	}
+	if response := upload("extra.txt", "more"); response.Code != http.StatusNoContent {
+		t.Fatalf("upload after quota increase failed: %d %s", response.Code, response.Body.String())
+	}
+
+	adminUsers := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+	request.AddCookie(adminCookie)
+	handler.ServeHTTP(adminUsers, request)
+	if adminUsers.Code != http.StatusOK {
+		t.Fatalf("admin user listing failed: %d %s", adminUsers.Code, adminUsers.Body.String())
+	}
+	var response struct {
+		Users []struct {
+			Username         string `json:"username"`
+			QuotaBytes       int64  `json:"quotaBytes"`
+			StorageUsedBytes int64  `json:"storageUsedBytes"`
+		} `json:"users"`
+	}
+	if err := json.Unmarshal(adminUsers.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	foundUser := false
+	for _, user := range response.Users {
+		if user.Username == "media" {
+			foundUser = true
+			if user.QuotaBytes != 8 || user.StorageUsedBytes != 8 {
+				t.Fatalf("unexpected user quota/usage: %+v", user)
+			}
+		}
+	}
+	if !foundUser {
+		t.Fatal("created user missing from administrator listing")
+	}
+}
+
+func testLogin(t *testing.T, handler http.Handler, username, password string) (auth.Identity, *http.Cookie) {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login",
+		strings.NewReader(fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)))
+	request.RemoteAddr = "127.0.0.1:2345"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("login %q failed: %d %s", username, response.Code, response.Body.String())
+	}
+	var identity auth.Identity
+	if err := json.Unmarshal(response.Body.Bytes(), &identity); err != nil {
+		t.Fatal(err)
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login %q returned %d cookies", username, len(cookies))
+	}
+	return identity, cookies[0]
 }

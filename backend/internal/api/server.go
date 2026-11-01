@@ -3,22 +3,27 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sharperr/asns/backend/internal/auth"
 	"github.com/sharperr/asns/backend/internal/database"
+	"github.com/sharperr/asns/backend/internal/files"
 	"github.com/sharperr/asns/backend/internal/monitoring"
 )
 
@@ -30,8 +35,10 @@ type auditStore interface {
 
 type Handler struct {
 	auth          *auth.Service
+	store         *database.Store
 	audit         auditStore
 	monitor       *monitoring.System
+	storage       *files.Manager
 	secureCookie  bool
 	webDir        string
 	loginMu       sync.Mutex
@@ -43,10 +50,14 @@ type loginWindow struct {
 	count int
 }
 
-func NewServer(store *database.Store, authService *auth.Service, monitor *monitoring.System, secureCookie bool, webDir string) http.Handler {
+func NewServer(store *database.Store, authService *auth.Service, monitor *monitoring.System, secureCookie bool, webDir string, storageRoots ...string) http.Handler {
+	storageRoot := "/var/lib/asns/users"
+	if len(storageRoots) > 0 && storageRoots[0] != "" {
+		storageRoot = storageRoots[0]
+	}
 	h := &Handler{
-		auth: authService, audit: store, monitor: monitor, secureCookie: secureCookie,
-		webDir: webDir, loginAttempts: make(map[string]loginWindow),
+		auth: authService, store: store, audit: store, monitor: monitor, secureCookie: secureCookie,
+		webDir: webDir, storage: files.NewManager(storageRoot), loginAttempts: make(map[string]loginWindow),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", h.health)
@@ -55,6 +66,14 @@ func NewServer(store *database.Store, authService *auth.Service, monitor *monito
 	mux.Handle("GET /api/v1/auth/me", h.requireAuth(http.HandlerFunc(h.me)))
 	mux.Handle("GET /api/v1/system", h.requireAuth(http.HandlerFunc(h.system)))
 	mux.Handle("GET /api/v1/disks", h.requireAuth(http.HandlerFunc(h.disks)))
+	mux.Handle("GET /api/v1/users", h.requireAdmin(http.HandlerFunc(h.listUsers)))
+	mux.Handle("POST /api/v1/users", h.requireAdmin(http.HandlerFunc(h.createUser)))
+	mux.Handle("PUT /api/v1/users/{id}/quota", h.requireAdmin(http.HandlerFunc(h.updateUserQuota)))
+	mux.Handle("GET /api/v1/files", h.requireAuth(http.HandlerFunc(h.listFiles)))
+	mux.Handle("POST /api/v1/files/upload", h.requireAuth(http.HandlerFunc(h.uploadFile)))
+	mux.Handle("POST /api/v1/files/directory", h.requireAuth(http.HandlerFunc(h.createDirectory)))
+	mux.Handle("GET /api/v1/files/download", h.requireAuth(http.HandlerFunc(h.downloadFile)))
+	mux.Handle("DELETE /api/v1/files", h.requireAuth(http.HandlerFunc(h.removeFile)))
 	mux.Handle("/api/", http.NotFoundHandler())
 	mux.HandleFunc("/", h.serveUI)
 	return secureHeaders(mux)
@@ -156,6 +175,229 @@ func (h *Handler) disks(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"disks": disks})
+}
+
+func (h *Handler) requireAdmin(next http.Handler) http.Handler {
+	return h.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		identity, ok := identityFromContext(r.Context())
+		if !ok || identity.Role != "admin" {
+			writeError(w, http.StatusForbidden, "administrator access required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
+}
+
+func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := h.store.ListUsers(r.Context())
+	if err != nil {
+		log.Printf("ASNS user listing failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "unable to list users")
+		return
+	}
+	result := make([]database.User, 0, len(users))
+	for _, user := range users {
+		used, err := h.storage.Usage(user.ID)
+		if err != nil {
+			log.Printf("ASNS user storage usage failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "unable to read user storage usage")
+			return
+		}
+		user.StorageUsed = used
+		result = append(result, user)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": result})
+}
+
+func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		QuotaBytes int64  `json:"quotaBytes"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	user, err := h.store.CreateUser(r.Context(), request.Username, request.Password, request.QuotaBytes)
+	if errors.Is(err, database.ErrUserExists) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, _, err := h.storage.List(user.ID, ""); err != nil {
+		if deleteErr := h.store.DeleteUser(r.Context(), user.ID); deleteErr != nil {
+			log.Printf("ASNS rollback failed after storage initialization: %v", deleteErr)
+		}
+		log.Printf("ASNS user storage initialization failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "unable to initialize user storage")
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "users.created")
+	writeJSON(w, http.StatusCreated, user)
+}
+
+func (h *Handler) updateUserQuota(w http.ResponseWriter, r *http.Request) {
+	userID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || userID <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid user ID")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	var request struct {
+		QuotaBytes int64 `json:"quotaBytes"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	err = h.storage.WithLock(func() error {
+		return h.store.SetUserQuota(r.Context(), userID, request.QuotaBytes)
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	h.recordAudit(r, &identity.ID, "users.quota_updated")
+	writeJSON(w, http.StatusOK, map[string]int64{"userId": userID, "quotaBytes": request.QuotaBytes})
+}
+
+func (h *Handler) listFiles(w http.ResponseWriter, r *http.Request) {
+	identity, _ := identityFromContext(r.Context())
+	directory := r.URL.Query().Get("directory")
+	entries, used, err := h.storage.List(identity.ID, directory)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	user, err := h.store.UserByUsername(r.Context(), identity.Username)
+	if err != nil {
+		log.Printf("ASNS storage quota lookup failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "storage quota is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": entries, "directory": directory, "usedBytes": used, "quotaBytes": user.QuotaBytes,
+	})
+}
+
+func (h *Handler) uploadFile(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, files.MaxUploadBytes+(1<<20))
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid upload request")
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "a file is required")
+		return
+	}
+	defer file.Close()
+	name := header.Filename
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		writeError(w, http.StatusBadRequest, "invalid file name")
+		return
+	}
+	relative := path.Join(r.FormValue("directory"), name)
+	identity, _ := identityFromContext(r.Context())
+	if header.Size > files.MaxUploadBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "file exceeds the 1 GiB per-upload limit")
+		return
+	}
+	getQuota := func() (int64, error) {
+		user, err := h.store.UserByUsername(r.Context(), identity.Username)
+		if err != nil {
+			return 0, fmt.Errorf("look up upload quota: %w", err)
+		}
+		return user.QuotaBytes, nil
+	}
+	if err := h.storage.Upload(identity.ID, relative, header.Size, getQuota, file); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	h.recordAudit(r, &identity.ID, "files.uploaded")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) createDirectory(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	var request struct {
+		Path string `json:"path"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	identity, _ := identityFromContext(r.Context())
+	if err := h.storage.CreateDirectory(identity.ID, request.Path); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	h.recordAudit(r, &identity.ID, "files.directory_created")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
+	identity, _ := identityFromContext(r.Context())
+	file, info, err := h.storage.Open(identity.ID, r.URL.Query().Get("path"))
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	defer file.Close()
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": info.Name()}))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+}
+
+func (h *Handler) removeFile(w http.ResponseWriter, r *http.Request) {
+	identity, _ := identityFromContext(r.Context())
+	if err := h.storage.Remove(identity.ID, r.URL.Query().Get("path")); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	h.recordAudit(r, &identity.ID, "files.deleted")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func writeStorageError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, files.ErrQuotaExceeded):
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+	case errors.Is(err, files.ErrInvalidPath):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, os.ErrNotExist):
+		writeError(w, http.StatusNotFound, "storage entry not found")
+	case errors.Is(err, os.ErrExist):
+		writeError(w, http.StatusConflict, "storage entry already exists")
+	default:
+		log.Printf("ASNS file operation failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "file operation failed")
+	}
+}
+
+func decodeJSON(r *http.Request, destination any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return errors.New("invalid JSON request")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return errors.New("request must contain one JSON object")
+	}
+	return nil
 }
 
 type identityContextKey struct{}

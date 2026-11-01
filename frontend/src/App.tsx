@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, Bell, Check, ChevronDown, ChevronRight, CircleHelp, Cpu, Database,
-  HardDrive, LayoutDashboard, LogOut, Menu, Moon, Network, RefreshCw, Search,
-  Settings, ShieldCheck, SlidersHorizontal, Sun, UserRound, X,
+  Download, FileUp, Folder, FolderPlus, HardDrive, LayoutDashboard, LogOut,
+  Menu, Moon, Network, RefreshCw, Search, Settings, ShieldCheck,
+  SlidersHorizontal, Sun, Trash2, UserPlus, UserRound, X,
 } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { api } from "./services/api";
-import type { Disk, Identity, SystemSnapshot } from "./types/system";
+import type { Disk, Identity, ManagedUser, StorageEntry, StorageListing, SystemSnapshot } from "./types/system";
 
 type Page =
   | "Overview"
@@ -108,6 +109,288 @@ function Login({ onLogin }: { onLogin: (identity: Identity) => void }) {
         <p className="login-foot"><ShieldCheck size={14} /> Sessions expire automatically after 12 hours</p>
       </form>
     </main>
+  );
+}
+
+function quotaFromGiB(value: string): number {
+  const parsed = Number(value);
+  const bytes = Math.round(parsed * 1024 ** 3);
+  if (!Number.isFinite(parsed) || parsed < 0 || !Number.isSafeInteger(bytes)) {
+    throw new Error("Enter a valid GiB amount, or 0 for unlimited.");
+  }
+  return bytes;
+}
+
+function quotaGiB(bytes: number): string {
+  return bytes === 0 ? "0" : String(bytes / 1024 ** 3);
+}
+
+function UserManagementPage({ identity }: { identity: Identity }) {
+  const [users, setUsers] = useState<ManagedUser[]>([]);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [quota, setQuota] = useState("10");
+  const [quotaInputs, setQuotaInputs] = useState<Record<number, string>>({});
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const loadUsers = useCallback(async () => {
+    setError("");
+    try {
+      setUsers((await api.users()).users);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to load users");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void loadUsers(); }, [loadUsers]);
+
+  async function createUser(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      await api.createUser(username, password, quotaFromGiB(quota), identity.csrfToken);
+      setUsername("");
+      setPassword("");
+      await loadUsers();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to create user");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function updateQuota(event: React.FormEvent<HTMLFormElement>, user: ManagedUser) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      await api.setUserQuota(user.id, quotaFromGiB(quotaInputs[user.id] ?? quotaGiB(user.quotaBytes)), identity.csrfToken);
+      await loadUsers();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to update storage limit");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="management-stack">
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      <section className="panel user-create-panel">
+        <div className="panel-heading">
+          <div><h2><UserPlus size={16} /> Create an account</h2>
+            <p>Each account gets an isolated ASNS storage folder and its own quota.</p></div>
+        </div>
+        <form className="user-create-form" onSubmit={(event) => void createUser(event)}>
+          <label>Username
+            <input value={username} onChange={(event) => setUsername(event.target.value)}
+              pattern="[A-Za-z0-9._-]{1,64}" maxLength={64} autoComplete="off" required />
+          </label>
+          <label>Temporary password
+            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)}
+              minLength={12} maxLength={72} autoComplete="new-password" required />
+          </label>
+          <label>Storage limit (GiB)
+            <input type="number" min="0" step="any" value={quota}
+              onChange={(event) => setQuota(event.target.value)} required />
+          </label>
+          <Button className="primary-button" disabled={saving}><UserPlus size={15} /> Create user</Button>
+          <small>Use 0 for unlimited. Passwords must be at least 12 characters.</small>
+        </form>
+      </section>
+
+      <section className="panel managed-users-panel">
+        <div className="panel-heading">
+          <div><h2>Accounts and storage</h2><p>Usage counts regular files inside each account's ASNS folder.</p></div>
+          <Button variant="outline" className="outline-button" onClick={() => void loadUsers()} disabled={loading}>
+            <RefreshCw size={14} /> Refresh
+          </Button>
+        </div>
+        {loading ? <div className="management-empty">Loading accounts…</div> : users.length === 0
+          ? <div className="management-empty">No accounts are configured.</div>
+          : <div className="managed-user-list">
+            {users.map((user) => {
+              const percent = user.quotaBytes > 0
+                ? Math.min(100, user.storageUsedBytes / user.quotaBytes * 100)
+                : 0;
+              return (
+                <article className="managed-user-row" key={user.id}>
+                  <div className="managed-user-summary">
+                    <span className="profile-avatar"><UserRound size={15} /></span>
+                    <div><strong>{user.username}</strong><small>{user.role === "admin" ? "Administrator" : "Standard account"}</small></div>
+                  </div>
+                  <div className="managed-user-quota">
+                    <div className="managed-quota-label">
+                      <span>{formatBytes(user.storageUsedBytes)} used</span>
+                      <span>{user.quotaBytes === 0 ? "Unlimited" : `of ${formatBytes(user.quotaBytes)}`}</span>
+                    </div>
+                    <div className="quota-track"><span style={{ width: `${percent}%` }} /></div>
+                  </div>
+                  {user.role === "user" ? (
+                    <form className="quota-edit-form" onSubmit={(event) => void updateQuota(event, user)}>
+                      <label className="sr-only" htmlFor={`quota-${user.id}`}>Storage limit for {user.username} in GiB</label>
+                      <input id={`quota-${user.id}`} type="number" min="0" step="any"
+                        value={quotaInputs[user.id] ?? quotaGiB(user.quotaBytes)}
+                        onChange={(event) => setQuotaInputs((values) => ({ ...values, [user.id]: event.target.value }))} />
+                      <span>GiB</span>
+                      <Button variant="outline" className="outline-button" disabled={saving}>Save</Button>
+                    </form>
+                  ) : <span className="admin-account-badge">Full access</span>}
+                </article>
+              );
+            })}
+          </div>}
+        <p className="quota-footnote">Changing a limit below current usage keeps existing files but blocks uploads until usage is back under the limit.</p>
+      </section>
+    </div>
+  );
+}
+
+function FileManagerPage({ identity }: { identity: Identity }) {
+  const [directory, setDirectory] = useState("");
+  const [listing, setListing] = useState<StorageListing | null>(null);
+  const [folderName, setFolderName] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const refresh = useCallback(async () => {
+    setError("");
+    try {
+      setListing(await api.files(directory));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to load your storage");
+    }
+  }, [directory]);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  async function upload(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.uploadFile(file, directory, identity.csrfToken);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Upload failed");
+    } finally {
+      setBusy(false);
+      event.target.value = "";
+    }
+  }
+
+  async function createFolder(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = folderName.trim();
+    if (!name || name.includes("/") || name.includes("\\")) {
+      setError("Enter a folder name without path separators.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await api.createDirectory(directory ? `${directory}/${name}` : name, identity.csrfToken);
+      setFolderName("");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to create folder");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function download(entry: StorageEntry) {
+    try {
+      const blob = await api.downloadFile(entry.path);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = entry.name;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Download failed");
+    }
+  }
+
+  async function remove(entry: StorageEntry) {
+    if (!window.confirm(`Delete ${entry.name}? Only empty folders can be deleted.`)) return;
+    setError("");
+    try {
+      await api.deleteFile(entry.path, identity.csrfToken);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to delete entry");
+    }
+  }
+
+  const usedPercent = listing?.quotaBytes
+    ? Math.min(100, listing.usedBytes / listing.quotaBytes * 100)
+    : 0;
+
+  return (
+    <div className="management-stack">
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      <section className="panel user-storage-summary">
+        <div><span className="eyebrow">YOUR ASNS STORAGE</span>
+          <strong>{listing ? formatBytes(listing.usedBytes) : "—"}</strong>
+          <small>{listing?.quotaBytes ? `of ${formatBytes(listing.quotaBytes)} used` : "No storage limit"}</small>
+        </div>
+        <div className="quota-track"><span style={{ width: `${usedPercent}%` }} /></div>
+      </section>
+      <section className="panel file-manager-panel">
+        <div className="panel-heading">
+          <div><h2><Folder size={16} /> Personal files</h2>
+            <p>Only you can access files in this account's private storage.</p></div>
+          <Button variant="outline" className="outline-button" onClick={() => void refresh()}><RefreshCw size={14} /> Refresh</Button>
+        </div>
+        <div className="file-toolbar">
+          <div className="file-breadcrumb">
+            <button onClick={() => setDirectory("")}>My files</button>
+            {directory && <><ChevronRight size={14} /><span>{directory}</span></>}
+          </div>
+          <div className="file-actions">
+            <form onSubmit={(event) => void createFolder(event)}>
+              <input aria-label="New folder name" value={folderName} onChange={(event) => setFolderName(event.target.value)}
+                placeholder="Folder name" required />
+              <Button variant="outline" className="outline-button" disabled={busy}><FolderPlus size={14} /> New folder</Button>
+            </form>
+            <input ref={fileInput} className="sr-only" type="file" onChange={(event) => void upload(event)} />
+            <Button className="primary-button" disabled={busy} onClick={() => fileInput.current?.click()}>
+              <FileUp size={14} /> {busy ? "Working…" : "Upload"}
+            </Button>
+          </div>
+        </div>
+        <div className="file-list">
+          {directory && <button className="file-row file-parent" onClick={() => setDirectory(directory.split("/").slice(0, -1).join("/"))}>
+            <Folder size={16} /><span>..</span><small>Parent folder</small>
+          </button>}
+          {listing?.entries.map((entry) => (
+            <div className="file-row" key={entry.path}>
+              {entry.directory ? <Folder size={16} /> : <Database size={16} />}
+              {entry.directory
+                ? <button className="file-name" onClick={() => setDirectory(entry.path)}>{entry.name}</button>
+                : <button className="file-name" onClick={() => void download(entry)}>{entry.name}</button>}
+              <small>{entry.directory ? "Folder" : formatBytes(entry.sizeBytes)}</small>
+              {!entry.directory && <button className="file-action" aria-label={`Download ${entry.name}`}
+                onClick={() => void download(entry)}><Download size={15} /></button>}
+              <button className="file-action danger-action" aria-label={`Delete ${entry.name}`}
+                onClick={() => void remove(entry)}><Trash2 size={15} /></button>
+            </div>
+          ))}
+          {listing && listing.entries.length === 0 && <div className="management-empty">This folder is empty. Upload a file or create a folder to get started.</div>}
+          {!listing && <div className="management-empty">Loading your files…</div>}
+        </div>
+        <p className="quota-footnote">Uploads are limited to 1 GiB per file and are blocked when they would exceed your assigned quota.</p>
+      </section>
+    </div>
   );
 }
 
@@ -232,10 +515,11 @@ function App() {
   );
   const filteredPages = useMemo(() => {
     const term = search.trim().toLowerCase();
-    return [...workspacePages, ...managementPages].filter((item) =>
+    const availablePages = managementPages.filter((item) => item.label !== "Users" || identity?.role === "admin");
+    return [...workspacePages, ...availablePages].filter((item) =>
       item.label.toLowerCase().includes(term),
     );
-  }, [search]);
+  }, [identity?.role, search]);
 
   function navigate(nextPage: Page) {
     setPage(nextPage);
@@ -311,7 +595,7 @@ function App() {
         </nav>
         <div className="nav-caption manage-caption">MANAGE</div>
         <nav aria-label="Management">
-          {managementPages.map(({ label, icon: Icon }) => (
+          {managementPages.filter((item) => item.label !== "Users" || identity.role === "admin").map(({ label, icon: Icon }) => (
             <NavButton key={label} label={label} icon={<Icon size={17} />} active={page === label}
               onClick={() => navigate(label)} />
           ))}
@@ -401,13 +685,13 @@ function App() {
               <button className="profile-button" aria-expanded={popover === "profile"}
                 onClick={() => setPopover(popover === "profile" ? null : "profile")}>
                 <span className="profile-avatar">{identity.username.slice(0, 1).toUpperCase()}</span>
-                <span className="profile-name">{identity.username}<small>Administrator</small></span>
+                <span className="profile-name">{identity.username}<small>{identity.role === "admin" ? "Administrator" : "Standard account"}</small></span>
                 <ChevronDown size={14} className="profile-chevron" />
               </button>
               {popover === "profile" && (
                 <div className="header-popover profile-popover">
                   <div className="profile-summary"><span className="profile-avatar">{identity.username.slice(0, 1).toUpperCase()}</span>
-                    <span><strong>{identity.username}</strong><small>Administrator account</small></span>
+                    <span><strong>{identity.username}</strong><small>{identity.role === "admin" ? "Administrator account" : "Standard account"}</small></span>
                   </div>
                   <button className="signout-button" onClick={() => void signOut()}><LogOut size={15} /> Sign out</button>
                 </div>
@@ -425,6 +709,10 @@ function App() {
                 ? "A clear picture of what's happening on your NAS."
                 : page === "Storage"
                   ? "Physical block devices discovered on this Linux host."
+                  : page === "Users"
+                    ? "Create accounts and manage storage limits."
+                    : page === "File manager"
+                      ? "Manage files in your private, quota-limited ASNS storage."
                   : `${page} is part of the ASNS roadmap.`}</p>
             </div>
             {page === "Overview" && (
@@ -446,7 +734,10 @@ function App() {
           {page === "Storage" && (
             <StoragePage disks={disks} error={systemError} onRefresh={() => void refresh()} />
           )}
-          {page !== "Overview" && page !== "Storage" && <ComingSoonPage page={page} />}
+          {page === "Users" && identity.role === "admin" && <UserManagementPage identity={identity} />}
+          {page === "File manager" && <FileManagerPage identity={identity} />}
+          {page !== "Overview" && page !== "Storage" && page !== "Users" && page !== "File manager" &&
+            <ComingSoonPage page={page} />}
 
           {page === "Overview" && (
             <>

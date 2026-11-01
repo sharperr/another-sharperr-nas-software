@@ -50,7 +50,8 @@ func run() error {
 		return errors.New("ASNS_COOKIE_SECURE must be true or false")
 	}
 
-	handler := api.NewServer(store, auth.NewService(store), monitor, secureCookie, os.Getenv("ASNS_WEB_DIR"))
+	handler := api.NewServer(store, auth.NewService(store), monitor, secureCookie, os.Getenv("ASNS_WEB_DIR"),
+		envOr("ASNS_USER_STORAGE_DIR", filepath.Join(filepath.Dir(dbPath), "users")))
 	server := &http.Server{
 		Addr:              envOr("ASNS_ADDR", "127.0.0.1:8080"),
 		Handler:           handler,
