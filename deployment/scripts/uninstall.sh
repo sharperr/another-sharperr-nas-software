@@ -14,15 +14,15 @@ fail() {
 }
 
 if [[ "${EUID}" -ne 0 ]]; then
-  fail "run as root: sudo bash deployment/scripts/uninstall.sh"
+  fail "run as root: bash /opt/asns/source/deployment/scripts/uninstall.sh"
 fi
 
 purge=0
 if [[ $# -gt 1 ]]; then
-  fail "usage: sudo bash deployment/scripts/uninstall.sh [--purge]"
+  fail "usage: bash /opt/asns/source/deployment/scripts/uninstall.sh [--purge]"
 fi
 if [[ $# -eq 1 ]]; then
-  [[ "$1" == "--purge" ]] || fail "usage: sudo bash deployment/scripts/uninstall.sh [--purge]"
+  [[ "$1" == "--purge" ]] || fail "usage: bash /opt/asns/source/deployment/scripts/uninstall.sh [--purge]"
   [[ -t 0 ]] || fail "--purge requires an interactive confirmation"
   printf 'This permanently deletes %s and %s, including the ASNS database. Type DELETE to continue: ' "${DATA_DIR}" "${CONFIG_DIR}"
   read -r confirmation

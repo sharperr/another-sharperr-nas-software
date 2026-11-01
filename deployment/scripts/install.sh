@@ -19,7 +19,7 @@ fail() {
 }
 
 if [[ "${EUID}" -ne 0 ]]; then
-  fail "run the online installer with: set -o pipefail && curl -fsSL https://raw.githubusercontent.com/sharperr/another-sharperr-nas-software/main/deployment/scripts/install.sh | sudo bash"
+  fail "this installer requires root; from a root shell run: set -o pipefail && curl -fsSL https://raw.githubusercontent.com/sharperr/another-sharperr-nas-software/main/deployment/scripts/install.sh | bash"
 fi
 
 if [[ -r /etc/os-release ]]; then
@@ -218,5 +218,5 @@ systemctl restart "${SERVICE_NAME}"
 printf '\nASNS 0.1.0 is installed and enabled.\n'
 printf 'Dashboard: http://127.0.0.1:8080\n'
 printf 'CLI:       asns help | asns health | asns launch\n'
-printf '\nUninstall without deleting NAS data: sudo bash deployment/scripts/uninstall.sh\n'
-printf 'Uninstall and remove ASNS config/database: sudo bash deployment/scripts/uninstall.sh --purge\n'
+printf '\nUninstall without deleting NAS data: bash %s/deployment/scripts/uninstall.sh\n' "${SOURCE_DIR}"
+printf 'Uninstall and remove ASNS config/database: bash %s/deployment/scripts/uninstall.sh --purge\n' "${SOURCE_DIR}"
