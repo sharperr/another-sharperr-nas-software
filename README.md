@@ -1,75 +1,96 @@
 # Another Sharperr NAS Software (ASNS)
 
-ASNS is a self-hosted NAS management platform for existing Linux systems. Version **0.1.0** is an early foundation—not a replacement operating system. It currently provides a real-time system dashboard, physical disk discovery, and administrator session authentication.
+ASNS is a self-hosted NAS management platform for existing Linux systems—not a replacement operating system. Version **0.1.0** provides a Go REST API, SQLite-backed administrator authentication, live Linux system monitoring, physical disk discovery, a React dashboard, and a small command-line client.
+
+## One-line install
+
+From the root of an ASNS source checkout on Debian 13, run:
+
+```sh
+sudo bash deployment/scripts/install.sh
+```
+
+The installer installs the required Debian build packages, builds the frontend and Go API/CLI, installs the frontend and API under `/opt/asns`, installs the `asns` CLI in `/usr/local/bin`, creates a dedicated unprivileged service account, and enables the systemd service. On a new install it generates a random initial administrator password and prints it before building; save it. After the first successful startup, the bootstrap password is removed from the service environment. Reinstalling preserves the existing configuration and database.
+
+The service listens on `127.0.0.1:8080`. Use a TLS-terminating reverse proxy for remote access; do not expose the HTTP service directly to an untrusted network.
+
+### CLI
+
+- `asns help` — show available commands.
+- `asns health` — check the ASNS API and print its version.
+- `asns launch` — start the systemd service if it is stopped, wait for the API, and open the dashboard when a desktop browser is available.
+- Set `ASNS_URL` to use a different HTTP(S) base URL. The default is `http://127.0.0.1:8080`.
+
+### One-line uninstall
+
+Remove the application, service, and CLI while preserving the database and configuration:
+
+```sh
+sudo bash deployment/scripts/uninstall.sh
+```
+
+To delete ASNS configuration and database as well, run `sudo bash deployment/scripts/uninstall.sh --purge` and type `DELETE` at the confirmation prompt. Neither uninstall form removes Debian packages installed for building ASNS.
 
 ## Requirements
 
-- Debian 13 or another Linux host with procfs and sysfs
+- Debian 13 on the NAS host, with Linux procfs and sysfs
 - Go 1.23 or newer
-- Node.js 20.19 or newer (or 22.12 or newer) with npm
+- Node.js 20.19 or newer, or 22.12 or newer, with npm
 
-## Development
+The installer checks these versions. It does not configure disk mounts, partitions, SMART, or network-facing TLS.
 
-1. Configure the initial administrator and start the API:
+## Full-stack development
 
-   ```sh
-   cd backend
-   ASNS_ADMIN_USERNAME=admin ASNS_ADMIN_PASSWORD='use-a-long-unique-password' go run ./cmd/asns
-   ```
-
-   On PowerShell, run `$env:ASNS_ADMIN_USERNAME="admin"` and `$env:ASNS_ADMIN_PASSWORD="use-a-long-unique-password"` before `go run ./cmd/asns`. The default API address is `127.0.0.1:8080`; the SQLite database is `backend/data/asns.db` when started from this directory.
-
-2. In another terminal, run the frontend:
+1. From the frontend directory, install dependencies and start both the Go API and frontend together:
 
    ```sh
    cd frontend
-   npm install
-   npm run dev
+   npm ci
+   ASNS_ADMIN_USERNAME=admin ASNS_ADMIN_PASSWORD='use-a-unique-password-of-at-least-12-characters' npm run dev:all
    ```
 
-   Open the Vite URL (normally `http://127.0.0.1:5173`) and sign in with the administrator credentials. Vite proxies API requests to the local Go server.
+   The initial API startup requires administrator credentials. Open `http://127.0.0.1:5173`; Vite proxies `/api` requests to Go. `Ctrl+C` stops both processes. For PowerShell, set `$env:ASNS_ADMIN_USERNAME` and `$env:ASNS_ADMIN_PASSWORD`, then run `npm.cmd run dev:all`. The API listens on `127.0.0.1:8080` and stores its development database at `backend/data/asns.db`.
 
-3. Run backend tests with `cd backend && go test ./...`; build the frontend with `cd frontend && npm run build`.
+2. To run only the API, use `cd backend` followed by `ASNS_ADMIN_USERNAME=admin ASNS_ADMIN_PASSWORD='use-a-unique-password-of-at-least-12-characters' go run ./cmd/asns`.
 
-## Production build
+3. Validate changes:
 
-Build the frontend and backend, then run the backend from the deployment directory:
+   ```sh
+   cd backend && go test ./... && go vet ./...
+   cd frontend && npm ci && npm audit && npm run build
+   ```
+
+## Manual production build
+
+The installer is preferred. To build without installing system files:
 
 ```sh
 cd frontend && npm ci && npm run build
-cd ../backend && go build -o ../asns ./cmd/asns
+cd ../backend && GOWORK=off go build -trimpath -o ../asns-server ./cmd/asns
+cd ../backend && GOWORK=off go build -trimpath -o ../asns ./cmd/asnsctl
 ```
 
-Set the following in the service environment file (replace the initial password with a unique secret):
+The server serves `frontend/dist` when `ASNS_WEB_DIR` points to that directory. Configure `ASNS_DB_PATH` to a persistent SQLite file. The server defaults to `127.0.0.1:8080`; set `ASNS_COOKIE_SECURE=true` when HTTPS is terminated in front of it. To create the initial administrator, provide `ASNS_ADMIN_USERNAME` and `ASNS_ADMIN_PASSWORD` on first startup; the password must be 12-72 supported characters. Remove those variables after the first account is created.
 
-```ini
-ASNS_WEB_DIR=/opt/asns/frontend/dist
-ASNS_DB_PATH=/var/lib/asns/asns.db
-ASNS_ADMIN_USERNAME=admin
-ASNS_ADMIN_PASSWORD=replace-with-a-unique-password-of-at-least-12-characters
-ASNS_COOKIE_SECURE=true
-```
-
-The administrator variables are only used when creating the first account and can be removed after startup. Set `ASNS_COOKIE_SECURE=true` when serving through HTTPS. The initial service binds to loopback by default; use a TLS-terminating reverse proxy for remote access.
-
-For systemd deployment, create a dedicated unprivileged `asns` user, install the executable and frontend build under `/opt/asns`, create `/var/lib/asns` owned by that account, configure `/etc/asns/asns.env`, and install [the service unit](./deployment/systemd/asns.service). Review the unit and set `ASNS_WEB_DIR=/opt/asns/frontend/dist` and `ASNS_DB_PATH=/var/lib/asns/asns.db` in the environment file before enabling it. Never run the web service as root.
+The service unit is [deployment/systemd/asns.service](./deployment/systemd/asns.service). It runs as a dedicated `asns` user with systemd filesystem protections. Never run the web process as root.
 
 ## API
 
-- `GET /api/v1/health` — unauthenticated process health
-- `POST /api/v1/auth/login` — create a session
-- `GET /api/v1/auth/me` — current administrator and CSRF token
-- `POST /api/v1/auth/logout` — end session (requires `X-CSRF-Token`)
-- `GET /api/v1/system` — live CPU, memory, network rates, and uptime
-- `GET /api/v1/disks` — physical block devices discovered via sysfs
+- `GET /api/v1/health` — unauthenticated process health.
+- `POST /api/v1/auth/login` — create an administrator session.
+- `GET /api/v1/auth/me` — current administrator and CSRF token.
+- `POST /api/v1/auth/logout` — end session; requires `X-CSRF-Token`.
+- `GET /api/v1/system` — live CPU, memory, network rates, and uptime.
+- `GET /api/v1/disks` — physical block devices discovered through sysfs.
 
 All endpoints other than health and login require an authenticated session. Non-GET requests require the session CSRF token.
 
-## Current limitations
+## Security and scope
 
-- Linux procfs/sysfs monitoring is unavailable on Windows and is not mocked.
-- Disk temperatures, SMART health, filesystems, and mount management are not implemented.
-- File management, SMB, Docker, monitoring history persistence, user administration, backups, and the privileged agent are not implemented. Their dashboard sections are marked unavailable rather than displaying fake data.
-- Advanced mode exposes extra live host metrics; configurable system settings are not implemented.
-- Dashboard updates use authenticated REST polling every three seconds; WebSocket streaming is not implemented yet.
-- Use a TLS reverse proxy for any remote access. The API does not terminate TLS.
+Passwords use bcrypt; only hashes of high-entropy session tokens are stored. Sessions expire after 12 hours. The API sets security headers, rate-limits login attempts, applies CSRF checks, and records authentication audit events. The web service is unprivileged and does not expose shell commands or the Docker socket.
+
+Dashboard metrics are read directly from Linux procfs/sysfs; unsupported host information is shown as unavailable, not replaced with sample values. The Advanced mode shows additional host details; Simple mode explains the displayed measurements. Theme and mode preferences are saved in the browser.
+
+Not implemented in this release: SMART health/temperatures, filesystem and mount management, file browsing, SMB, Docker management, persistent metric history, administrative user management, backups, privileged agent operations, and WebSockets. The corresponding dashboard sections are marked as planned and do not claim these features work. Monitoring refresh currently uses authenticated REST polling every three seconds.
+
+This development workspace may be used on Windows, but the live monitor reads Linux procfs/sysfs and therefore requires a Linux host to display system metrics. No Windows demonstration values are generated.

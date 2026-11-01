@@ -15,3 +15,5 @@ The first administrator is provisioned from `ASNS_ADMIN_USERNAME` and `ASNS_ADMI
 ## Frontend
 
 Vite runs independently in development and proxies `/api` to the Go service. A production frontend build can be served by the Go process by setting `ASNS_WEB_DIR` to the build output directory.
+
+The Debian source installer builds both the UI and API, installs a systemd unit running as the dedicated unprivileged `asns` account, and installs the `asns` CLI. `asns health` checks the API; `asns launch` starts the service if needed and optionally opens a local browser. Uninstall preserves `/var/lib/asns` and `/etc/asns` unless the operator explicitly requests and confirms `--purge`.
