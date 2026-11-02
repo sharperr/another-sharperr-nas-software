@@ -288,6 +288,76 @@ function MetricChart({ title, unit, samples, value }: {
   );
 }
 
+interface DonutSegment {
+  label: string;
+  value: number;
+  color: string;
+}
+
+interface DonutLegendItem {
+  label: string;
+  value: string;
+  color: string;
+}
+
+function DonutPanel({ title, description, displayValue, centerLabel, segments, legend }: {
+  title: string;
+  description: string;
+  displayValue: string;
+  centerLabel: string;
+  segments: DonutSegment[];
+  legend: DonutLegendItem[];
+}) {
+  const circumference = 2 * Math.PI * 43;
+  const total = segments.reduce((sum, segment) => sum + Math.max(0, segment.value), 0);
+  let offset = 0;
+  const arcs = total > 0 ? segments.flatMap((segment) => {
+    const fraction = Math.max(0, segment.value) / total;
+    if (fraction <= 0) return [];
+    const length = circumference * fraction;
+    const currentOffset = offset;
+    offset += length;
+    return [{ ...segment, length, offset: currentOffset }];
+  }) : [];
+
+  return (
+    <article className="panel dashboard-chart-panel">
+      <header className="dashboard-chart-heading">
+        <div><h2>{title}</h2><p>{description}</p></div>
+        <span className={`dashboard-chart-live ${total === 0 ? "dashboard-chart-unavailable" : ""}`}>
+          <i />{total > 0 ? "LIVE" : "NO DATA"}
+        </span>
+      </header>
+      <div className="dashboard-chart-content">
+        <svg className="dashboard-donut" viewBox="0 0 120 120" role="img"
+          aria-label={`${title}: ${displayValue}${legend.length ? `; ${legend.map((item) => `${item.label} ${item.value}`).join(", ")}` : ""}`}>
+          <circle className="dashboard-donut-track" cx="60" cy="60" r="43" />
+          {arcs.map((arc) => (
+            <circle key={arc.label} className="dashboard-donut-segment" cx="60" cy="60" r="43"
+              stroke={arc.color} strokeDasharray={`${arc.length} ${circumference - arc.length}`}
+              strokeDashoffset={-arc.offset} />
+          ))}
+          <text className="dashboard-donut-value" x="60" y="58">{displayValue}</text>
+          <text className="dashboard-donut-label" x="60" y="74">{centerLabel}</text>
+        </svg>
+        <div className="dashboard-donut-legend">
+          {legend.length ? legend.map((item) => (
+            <div className="dashboard-legend-item" key={item.label}>
+              <i style={{ backgroundColor: item.color }} />
+              <span title={item.label}>{item.label}</span>
+              <b>{item.value}</b>
+            </div>
+          )) : <div className="dashboard-legend-empty">Live data unavailable</div>}
+        </div>
+      </div>
+      <footer className="dashboard-chart-footer">
+        <span><i />Host telemetry</span>
+        <span>{total > 0 ? `${segments.length} data ${segments.length === 1 ? "segment" : "segments"}` : "Awaiting sample"}</span>
+      </footer>
+    </article>
+  );
+}
+
 function MonitoringPage() {
   const [hours, setHours] = useState(24);
   const [samples, setSamples] = useState<MetricSample[]>([]);
@@ -1261,13 +1331,13 @@ function App() {
           </div>
         </header>
 
-        <div className="content">
+        <div className={`content ${page === "Overview" ? "overview-content" : ""}`}>
           <div className="page-heading">
             <div>
-              <div className="eyebrow">{page === "Overview" ? "YOUR SERVER AT A GLANCE" : "ASNS WORKSPACE"}</div>
-              <h1>{page === "Overview" ? "Good to see you." : page}</h1>
+              <div className="eyebrow">{page === "Overview" ? "INFRASTRUCTURE / OVERVIEW" : "ASNS WORKSPACE"}</div>
+              <h1>{page === "Overview" ? "System overview" : page}</h1>
               <p>{page === "Overview"
-                ? "A clear picture of what's happening on your NAS."
+                ? "Live resource utilization and storage inventory for this host."
                 : page === "Storage"
                   ? "Physical block devices discovered on this Linux host."
                   : page === "Monitoring"
@@ -1350,6 +1420,59 @@ function App() {
                   detail={snapshot ? `Transmit ${formatBytes(snapshot.network.sendBytesPerSecond)}/s` : "Waiting for network counters"}
                   percent={0} tone="amber" help="Combined inbound and outbound traffic across non-loopback interfaces."
                   simpleMode={simpleMode} explanation="Data arriving at your server each second." />
+              </section>
+
+              <section className="dashboard-charts" aria-label="Resource allocation">
+                <DonutPanel
+                  title="Processor utilization"
+                  description="Current compute load"
+                  displayValue={snapshot?.cpuPercent == null ? "—" : `${snapshot.cpuPercent.toFixed(0)}%`}
+                  centerLabel="IN USE"
+                  segments={snapshot?.cpuPercent == null ? [] : [
+                    { label: "In use", value: Math.max(0, Math.min(100, snapshot.cpuPercent)), color: "#3989d8" },
+                    { label: "Available", value: 100 - Math.max(0, Math.min(100, snapshot.cpuPercent)), color: "#293746" },
+                  ]}
+                  legend={[
+                    { label: "In use", value: snapshot?.cpuPercent == null ? "—" : `${snapshot.cpuPercent.toFixed(1)}%`, color: "#3989d8" },
+                    { label: "Available", value: snapshot?.cpuPercent == null ? "—" : `${(100 - snapshot.cpuPercent).toFixed(1)}%`, color: "#293746" },
+                  ]}
+                />
+                <DonutPanel
+                  title="Memory allocation"
+                  description={snapshot
+                    ? `${formatBytes(snapshot.memory.totalBytes)} total physical memory`
+                    : "Waiting for memory telemetry"}
+                  displayValue={snapshot ? `${snapshot.memory.percent.toFixed(0)}%` : "—"}
+                  centerLabel="IN USE"
+                  segments={snapshot ? [
+                    { label: "In use", value: snapshot.memory.usedBytes, color: "#28a6bd" },
+                    { label: "Available", value: Math.max(0, snapshot.memory.totalBytes - snapshot.memory.usedBytes), color: "#293746" },
+                  ] : []}
+                  legend={[
+                    { label: "In use", value: snapshot ? formatBytes(snapshot.memory.usedBytes) : "—", color: "#28a6bd" },
+                    { label: "Available", value: snapshot ? formatBytes(snapshot.memory.availableBytes) : "—", color: "#293746" },
+                  ]}
+                />
+                <DonutPanel
+                  title="Physical capacity"
+                  description="Raw device capacity by disk · not filesystem free space"
+                  displayValue={disks.length ? formatBytes(totalStorage) : "—"}
+                  centerLabel={disks.length ? `${disks.length} ${disks.length === 1 ? "DISK" : "DISKS"}` : "NO DATA"}
+                  segments={disks.map((disk, index) => ({
+                    label: disk.name,
+                    value: disk.capacityBytes,
+                    color: ["#3989d8", "#28a6bd", "#7d70c8", "#c08b3f", "#3baf82", "#667b92"][index % 6],
+                  }))}
+                  legend={disks.slice(0, 5).map((disk, index) => ({
+                    label: disk.name,
+                    value: formatBytes(disk.capacityBytes),
+                    color: ["#3989d8", "#28a6bd", "#7d70c8", "#c08b3f", "#3baf82", "#667b92"][index % 6],
+                  })).concat(disks.length > 5 ? [{
+                    label: `+${disks.length - 5} more`,
+                    value: formatBytes(disks.slice(5).reduce((sum, disk) => sum + disk.capacityBytes, 0)),
+                    color: "#667b92",
+                  }] : [])}
+                />
               </section>
 
               <section className="lower-grid">
